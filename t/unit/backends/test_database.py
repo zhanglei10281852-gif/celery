@@ -641,6 +641,138 @@ class test_DatabaseBackend:
         x.forget()
         assert x.result is None
 
+    def test_forget_persists_boundary_and_masks_late_terminal_store(self):
+        from celery.backends.database import _FORGOTTEN_STATUS
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_failure(tid, KeyError('boom'), traceback='tb-secret')
+        tb.forget(tid)
+
+        # the boundary row exists with the internal marker only
+        session = tb.ResultSession()
+        row = session.query(Task).filter(Task.task_id == tid).first()
+        assert row is not None
+        assert row.status == _FORGOTTEN_STATUS
+        assert row.result is None
+        assert row.traceback is None
+        assert row.date_done is not None
+        session.close()
+
+        # but only plain PENDING is exposed through the result API
+        assert tb.get_state(tid) == states.PENDING
+        assert tb.get_result(tid) is None
+        assert tb.get_traceback(tid) is None
+        assert tb.task_result_exists(tid) is False
+
+        # late worker terminal write must not resurrect the result
+        tb.mark_as_done(tid, 'late-result')
+        assert tb.get_state(tid) == states.PENDING
+        assert tb.get_result(tid) is None
+        tb.store_result(tid, RuntimeError('late'), states.FAILURE,
+                        traceback='late-tb')
+        assert tb.get_state(tid) == states.PENDING
+        assert tb.get_traceback(tid) is None
+
+    def test_forget_boundary_respected_by_new_backend_instance(self):
+        # emulates a new process connecting to the same database
+        tb = DatabaseBackend(self.uri, app=self.app)
+        other = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_done(tid, 'result')
+        tb.forget(tid)
+
+        assert other.get_state(tid) == states.PENDING
+        other.mark_as_done(tid, 'from-another-process')
+        assert other.get_state(tid) == states.PENDING
+        assert other.get_result(tid) is None
+
+    def test_forget_boundary_expires_and_task_id_can_be_reused(self):
+        from datetime import timedelta
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_done(tid, 'first-run')
+        tb.forget(tid)
+        assert tb.get_state(tid) == states.PENDING
+
+        # emulate result_expires elapsing before cleanup
+        session = tb.ResultSession()
+        session.query(Task).filter(Task.task_id == tid).update(
+            {'date_done': self.app.now() - timedelta(days=2)})
+        session.commit()
+        session.close()
+        tb.cleanup()
+
+        assert tb.task_result_exists(tid) is False
+        tb.mark_as_done(tid, 'second-run')
+        assert tb.get_state(tid) == states.SUCCESS
+        assert tb.get_result(tid) == 'second-run'
+
+    def test_forget_can_complete_after_failed_attempt(self):
+        from celery.backends.database import DatabaseError
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_done(tid, 'result')
+
+        original_forget = tb._forget
+
+        def always_failing_forget(task_id):
+            raise DatabaseError('database down', None, None)
+
+        tb._forget = always_failing_forget
+        with pytest.raises(DatabaseError):
+            tb.forget(tid)
+        # exhausted retries must not have forgotten anything
+        assert tb.get_state(tid) == states.SUCCESS
+        assert tb.get_result(tid) == 'result'
+
+        # retry once the backend recovered completes the forget
+        tb._forget = original_forget
+        tb.forget(tid)
+        assert tb.get_state(tid) == states.PENDING
+
+    def test_store_loses_insert_race_against_forget_boundary(self):
+        from celery.backends.database import _FORGOTTEN_STATUS
+        from sqlalchemy.exc import IntegrityError
+        from sqlalchemy.orm import Session
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        # a concurrent forget() has already committed the boundary row
+        tb._forget(tid)
+
+        # racing store reads a stale snapshot without the row, then its
+        # INSERT hits the unique constraint and must re-check and give up
+        real_locked = tb._locked_task
+        stale = [True]
+
+        def locked(session, task_id, _real=real_locked):
+            if stale[0]:
+                stale[0] = False
+                return None
+            return _real(session, task_id)
+
+        real_flush = Session.flush
+
+        def flush_raising_on_insert(session_self, *args, **kwargs):
+            # SQLAlchemy invokes flush() as an autoflush no-op on empty
+            # sessions too; only the actual INSERT must fail.
+            if session_self.new:
+                raise IntegrityError(
+                    'insert', {}, Exception('UNIQUE constraint'))
+            return real_flush(session_self, *args, **kwargs)
+
+        with patch.object(tb, '_locked_task', side_effect=locked):
+            with patch.object(
+                    Session, 'flush', autospec=True,
+                    side_effect=flush_raising_on_insert):
+                tb._store_result(tid, 'late', states.SUCCESS)
+
+        assert tb.get_state(tid) == states.PENDING
+        assert tb.get_result(tid) is None
+        row_session = tb.ResultSession()
+        row = row_session.query(Task).filter(Task.task_id == tid).first()
+        assert row.status == _FORGOTTEN_STATUS
+        row_session.close()
+
     def test_process_cleanup(self):
         tb = DatabaseBackend(self.uri, app=self.app)
         tb.process_cleanup()
@@ -747,6 +879,41 @@ class test_DatabaseBackend_result_extended():
         assert meta['name'] == 'mytask'
         assert meta['retries'] == 2
         assert meta['worker'] == "celery@worker_1"
+
+    def test_forget_wipes_extended_request_fields(self):
+        from celery.backends.database import _FORGOTTEN_STATUS
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        request = Context(args=(SomeClass(1),), kwargs={'foo': 'bar'},
+                          task='mytask', retries=2,
+                          hostname='celery@worker_1',
+                          delivery_info={'routing_key': 'celery'})
+        tb.store_result(tid, {'fizz': 'buzz'}, states.SUCCESS,
+                        request=request)
+
+        tb.forget(tid)
+
+        # nothing but PENDING is exposed through the result API
+        meta = tb.get_task_meta(tid, cache=False)
+        assert meta == {'status': states.PENDING, 'result': None}
+        assert 'args' not in meta and 'kwargs' not in meta
+        assert 'name' not in meta and 'worker' not in meta
+
+        # the boundary row itself keeps no request data
+        session = tb.ResultSession()
+        row = session.query(tb.task_cls).filter(
+            tb.task_cls.task_id == tid).first()
+        assert row.status == _FORGOTTEN_STATUS
+        assert row.result is None and row.traceback is None
+        assert row.name is None and row.args is None
+        assert row.kwargs is None and row.worker is None
+        assert row.retries is None and row.queue is None
+        session.close()
+
+        # a late write is suppressed as well
+        tb.store_result(tid, {'late': True}, states.SUCCESS,
+                        request=request)
+        assert tb.get_state(tid) == states.PENDING
 
     @pytest.mark.parametrize(
         'result_serializer, args, kwargs',

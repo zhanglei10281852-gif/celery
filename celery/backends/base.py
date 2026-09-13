@@ -194,6 +194,18 @@ class Backend:
     #: Set to true if the backend is persistent by default.
     persistent = True
 
+    #: When true, :meth:`forget` persists a short-lived "forgotten"
+    #: tombstone (expiring with :setting:`result_expires`) in addition to
+    #: deleting the result.  The tombstone makes the forget operation
+    #: survive a terminal ``store_result`` that was already in flight (or
+    #: that races with it): every read keeps reporting plain ``PENDING``
+    #: and late writes are discarded until the boundary expires, after
+    #: which the task id can be reused by a new task.
+    #:
+    #: Non-persistent backends (e.g. RPC) disable this and keep the
+    #: traditional in-process forget semantics.
+    supports_persistent_forget = True
+
     #: If true the backend can store a result payload that has been
     #: compressed, which means storing and returning arbitrary bytes
     #: unchanged.  Backends that put the payload inside a JSON document, or
@@ -801,6 +813,20 @@ class Backend:
         self._cache.pop(task_id, None)
         self._ensure_retryable(self._forget, task_id=task_id)
 
+    def _discard_pending_message(self, task_id):
+        """Drop a buffered out-of-band result for ``task_id``.
+
+        Used by asynchronous backends when a forget boundary is
+        established: a terminal state that was already consumed off the
+        wire but not yet awaited must not resolve a waiter afterwards.
+        """
+        try:
+            buf = self._pending_messages.pop(task_id)
+        except KeyError:
+            pass
+        else:
+            self._pending_messages.total -= len(buf)
+
     def _forget(self, task_id):
         raise NotImplementedError('backend does not implement forget.')
 
@@ -1098,6 +1124,14 @@ class BaseKeyValueStoreBackend(Backend):
     chord_keyprefix = 'chord-unlock-'
     implements_incr = False
 
+    #: Suffix appended to the task key to build the key of the persistent
+    #: forget boundary marker.
+    forgotten_keysuffix = '.f'
+
+    #: Opaque value stored under the forget-boundary key. It is never
+    #: decoded or exposed as task metadata.
+    forgotten_marker = b'1'
+
     def __init__(self, *args, **kwargs):
         if hasattr(self.key_t, '__func__'):  # pragma: no cover
             self.key_t = self.key_t.__func__  # remove binding
@@ -1153,6 +1187,13 @@ class BaseKeyValueStoreBackend(Backend):
         if not task_id:
             raise ValueError(f'task_id must not be empty. Got {task_id} instead.')
         return self._get_key_for(self.task_keyprefix, task_id, key)
+
+    def get_key_for_forgotten(self, task_id):
+        """Get the key holding the persistent forget boundary for a task."""
+        if not task_id:
+            raise ValueError(f'task_id must not be empty. Got {task_id} instead.')
+        return self._get_key_for(
+            self.task_keyprefix, task_id, self.forgotten_keysuffix)
 
     def get_key_for_group(self, group_id, key=''):
         """Get the cache key for a group by id."""
@@ -1228,6 +1269,11 @@ class BaseKeyValueStoreBackend(Backend):
             keys = list(ids)
             r = self._mget_to_results(self.mget([self.get_key_for_task(k)
                                                  for k in keys]), keys, READY_STATES)
+            # Hide results that a live forget boundary covers, even if the
+            # worker managed to write them after the task was forgotten.
+            forgotten = self._forgotten_task_ids(r.keys())
+            if forgotten:
+                r = {k: v for k, v in r.items() if k not in forgotten}
             cache.update(r)
             ids.difference_update({bytes_to_str(v) for v in r})
             for key, value in r.items():
@@ -1254,7 +1300,54 @@ class BaseKeyValueStoreBackend(Backend):
             if max_iterations and iterations >= max_iterations:
                 break
 
+    def _forgotten_task_ids(self, task_ids):
+        """Return the subset of ``task_ids`` covered by a forget boundary.
+
+        A single bulk read keeps the polling overhead of the persistent
+        forget check to one extra round trip per :meth:`get_many` pass.
+        Backends without :meth:`mget` simply skip the check here; single
+        task reads are still masked through :meth:`_get_task_meta_for`.
+        """
+        if not self.supports_persistent_forget:
+            return set()
+        ids = [bytes_to_str(task_id) for task_id in task_ids]
+        if not ids:
+            return set()
+        keys = [self.get_key_for_forgotten(task_id) for task_id in ids]
+        try:
+            values = self.mget(keys)
+        except NotImplementedError:
+            return set()
+        if hasattr(values, 'items'):
+            values = [values.get(key) for key in keys]
+        return {
+            task_id for task_id, marker in zip(ids, values) if marker
+        }
+
+    def _is_task_forgotten(self, task_id):
+        """Return true while the persistent forget boundary is live."""
+        if not self.supports_persistent_forget:
+            return False
+        return self.get(self.get_key_for_forgotten(task_id)) is not None
+
+    def _mark_task_forgotten(self, task_id):
+        """Persist the forget boundary, expiring with ``result_expires``."""
+        key = self.get_key_for_forgotten(task_id)
+        # Store through the same path as task meta so per-backend TTLs
+        # (e.g. memcached expiry) apply to the boundary as well.
+        self._set_with_state(key, self.forgotten_marker, states.PENDING)
+        self.expire(key, self.expires)
+
+    def _pending_task_meta(self):
+        """The only metadata a forgotten (or unseen) task may expose."""
+        return {'status': states.PENDING, 'result': None}
+
     def _forget(self, task_id):
+        # Persist the boundary before deleting the result: a terminal
+        # store_result landing in either order is then suppressed or
+        # masked until the boundary expires.
+        if self.supports_persistent_forget:
+            self._mark_task_forgotten(task_id)
         self.delete(self.get_key_for_task(task_id))
 
     def _store_result(self, task_id, result, state,
@@ -1274,12 +1367,25 @@ class BaseKeyValueStoreBackend(Backend):
         if current_meta['status'] == states.SUCCESS:
             return result
 
-        try:
-            self._set_with_state(self.get_key_for_task(task_id), self.encode(meta), state)
-        except BackendStoreError as ex:
-            raise BackendStoreError(str(ex), state=state, task_id=task_id) from ex
+        self._store_task_meta(task_id, self.encode(meta), state)
 
         return result
+
+    def _store_task_meta(self, task_id, encoded_meta, state):
+        """Persist encoded task meta, honouring a live forget boundary.
+
+        The default implementation is best-effort for non-atomic stores:
+        the boundary is checked again after writing and a result that was
+        resurrected by a concurrent ``forget()`` is removed again.
+        Backends with atomic primitives (Redis) override this method.
+        """
+        key = self.get_key_for_task(task_id)
+        try:
+            self._set_with_state(key, encoded_meta, state)
+        except BackendStoreError as ex:
+            raise BackendStoreError(str(ex), state=state, task_id=task_id) from ex
+        if self._is_task_forgotten(task_id):
+            self.delete(key)
 
     def _save_group(self, group_id, result):
         self._set_with_state(self.get_key_for_group(group_id),
@@ -1291,9 +1397,11 @@ class BaseKeyValueStoreBackend(Backend):
 
     def _get_task_meta_for(self, task_id):
         """Get task meta-data for a task by id."""
+        if self._is_task_forgotten(task_id):
+            return self._pending_task_meta()
         meta = self.get(self.get_key_for_task(task_id))
         if not meta:
-            return {'status': states.PENDING, 'result': None}
+            return self._pending_task_meta()
         return self.decode_result(meta)
 
     def task_result_exists(self, task_id):
@@ -1310,6 +1418,8 @@ class BaseKeyValueStoreBackend(Backend):
             bool: :const:`True` if the backend has a result for the task,
                 :const:`False` otherwise.
         """
+        if self._is_task_forgotten(task_id):
+            return False
         return bool(self.get(self.get_key_for_task(task_id)))
 
     def _restore_group(self, group_id):

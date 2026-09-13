@@ -1,0 +1,1068 @@
+diff --git a/celery/backends/base.py b/celery/backends/base.py
+index 8220e90db..1ab5dafd2 100644
+--- a/celery/backends/base.py
++++ b/celery/backends/base.py
+@@ -194,6 +194,18 @@ class Backend:
+     #: Set to true if the backend is persistent by default.
+     persistent = True
+ 
++    #: When true, :meth:`forget` persists a short-lived "forgotten"
++    #: tombstone (expiring with :setting:`result_expires`) in addition to
++    #: deleting the result.  The tombstone makes the forget operation
++    #: survive a terminal ``store_result`` that was already in flight (or
++    #: that races with it): every read keeps reporting plain ``PENDING``
++    #: and late writes are discarded until the boundary expires, after
++    #: which the task id can be reused by a new task.
++    #:
++    #: Non-persistent backends (e.g. RPC) disable this and keep the
++    #: traditional in-process forget semantics.
++    supports_persistent_forget = True
++
+     #: If true the backend can store a result payload that has been
+     #: compressed, which means storing and returning arbitrary bytes
+     #: unchanged.  Backends that put the payload inside a JSON document, or
+@@ -801,6 +813,20 @@ class Backend:
+         self._cache.pop(task_id, None)
+         self._ensure_retryable(self._forget, task_id=task_id)
+ 
++    def _discard_pending_message(self, task_id):
++        """Drop a buffered out-of-band result for ``task_id``.
++
++        Used by asynchronous backends when a forget boundary is
++        established: a terminal state that was already consumed off the
++        wire but not yet awaited must not resolve a waiter afterwards.
++        """
++        try:
++            buf = self._pending_messages.pop(task_id)
++        except KeyError:
++            pass
++        else:
++            self._pending_messages.total -= len(buf)
++
+     def _forget(self, task_id):
+         raise NotImplementedError('backend does not implement forget.')
+ 
+@@ -1098,6 +1124,14 @@ class BaseKeyValueStoreBackend(Backend):
+     chord_keyprefix = 'chord-unlock-'
+     implements_incr = False
+ 
++    #: Suffix appended to the task key to build the key of the persistent
++    #: forget boundary marker.
++    forgotten_keysuffix = '.f'
++
++    #: Opaque value stored under the forget-boundary key. It is never
++    #: decoded or exposed as task metadata.
++    forgotten_marker = b'1'
++
+     def __init__(self, *args, **kwargs):
+         if hasattr(self.key_t, '__func__'):  # pragma: no cover
+             self.key_t = self.key_t.__func__  # remove binding
+@@ -1154,6 +1188,13 @@ class BaseKeyValueStoreBackend(Backend):
+             raise ValueError(f'task_id must not be empty. Got {task_id} instead.')
+         return self._get_key_for(self.task_keyprefix, task_id, key)
+ 
++    def get_key_for_forgotten(self, task_id):
++        """Get the key holding the persistent forget boundary for a task."""
++        if not task_id:
++            raise ValueError(f'task_id must not be empty. Got {task_id} instead.')
++        return self._get_key_for(
++            self.task_keyprefix, task_id, self.forgotten_keysuffix)
++
+     def get_key_for_group(self, group_id, key=''):
+         """Get the cache key for a group by id."""
+         if not group_id:
+@@ -1228,6 +1269,11 @@ class BaseKeyValueStoreBackend(Backend):
+             keys = list(ids)
+             r = self._mget_to_results(self.mget([self.get_key_for_task(k)
+                                                  for k in keys]), keys, READY_STATES)
++            # Hide results that a live forget boundary covers, even if the
++            # worker managed to write them after the task was forgotten.
++            forgotten = self._forgotten_task_ids(r.keys())
++            if forgotten:
++                r = {k: v for k, v in r.items() if k not in forgotten}
+             cache.update(r)
+             ids.difference_update({bytes_to_str(v) for v in r})
+             for key, value in r.items():
+@@ -1254,7 +1300,54 @@ class BaseKeyValueStoreBackend(Backend):
+             if max_iterations and iterations >= max_iterations:
+                 break
+ 
++    def _forgotten_task_ids(self, task_ids):
++        """Return the subset of ``task_ids`` covered by a forget boundary.
++
++        A single bulk read keeps the polling overhead of the persistent
++        forget check to one extra round trip per :meth:`get_many` pass.
++        Backends without :meth:`mget` simply skip the check here; single
++        task reads are still masked through :meth:`_get_task_meta_for`.
++        """
++        if not self.supports_persistent_forget:
++            return set()
++        ids = [bytes_to_str(task_id) for task_id in task_ids]
++        if not ids:
++            return set()
++        keys = [self.get_key_for_forgotten(task_id) for task_id in ids]
++        try:
++            values = self.mget(keys)
++        except NotImplementedError:
++            return set()
++        if hasattr(values, 'items'):
++            values = [values.get(key) for key in keys]
++        return {
++            task_id for task_id, marker in zip(ids, values) if marker
++        }
++
++    def _is_task_forgotten(self, task_id):
++        """Return true while the persistent forget boundary is live."""
++        if not self.supports_persistent_forget:
++            return False
++        return self.get(self.get_key_for_forgotten(task_id)) is not None
++
++    def _mark_task_forgotten(self, task_id):
++        """Persist the forget boundary, expiring with ``result_expires``."""
++        key = self.get_key_for_forgotten(task_id)
++        # Store through the same path as task meta so per-backend TTLs
++        # (e.g. memcached expiry) apply to the boundary as well.
++        self._set_with_state(key, self.forgotten_marker, states.PENDING)
++        self.expire(key, self.expires)
++
++    def _pending_task_meta(self):
++        """The only metadata a forgotten (or unseen) task may expose."""
++        return {'status': states.PENDING, 'result': None}
++
+     def _forget(self, task_id):
++        # Persist the boundary before deleting the result: a terminal
++        # store_result landing in either order is then suppressed or
++        # masked until the boundary expires.
++        if self.supports_persistent_forget:
++            self._mark_task_forgotten(task_id)
+         self.delete(self.get_key_for_task(task_id))
+ 
+     def _store_result(self, task_id, result, state,
+@@ -1274,12 +1367,25 @@ class BaseKeyValueStoreBackend(Backend):
+         if current_meta['status'] == states.SUCCESS:
+             return result
+ 
++        self._store_task_meta(task_id, self.encode(meta), state)
++
++        return result
++
++    def _store_task_meta(self, task_id, encoded_meta, state):
++        """Persist encoded task meta, honouring a live forget boundary.
++
++        The default implementation is best-effort for non-atomic stores:
++        the boundary is checked again after writing and a result that was
++        resurrected by a concurrent ``forget()`` is removed again.
++        Backends with atomic primitives (Redis) override this method.
++        """
++        key = self.get_key_for_task(task_id)
+         try:
+-            self._set_with_state(self.get_key_for_task(task_id), self.encode(meta), state)
++            self._set_with_state(key, encoded_meta, state)
+         except BackendStoreError as ex:
+             raise BackendStoreError(str(ex), state=state, task_id=task_id) from ex
+-
+-        return result
++        if self._is_task_forgotten(task_id):
++            self.delete(key)
+ 
+     def _save_group(self, group_id, result):
+         self._set_with_state(self.get_key_for_group(group_id),
+@@ -1291,9 +1397,11 @@ class BaseKeyValueStoreBackend(Backend):
+ 
+     def _get_task_meta_for(self, task_id):
+         """Get task meta-data for a task by id."""
++        if self._is_task_forgotten(task_id):
++            return self._pending_task_meta()
+         meta = self.get(self.get_key_for_task(task_id))
+         if not meta:
+-            return {'status': states.PENDING, 'result': None}
++            return self._pending_task_meta()
+         return self.decode_result(meta)
+ 
+     def task_result_exists(self, task_id):
+@@ -1310,6 +1418,8 @@ class BaseKeyValueStoreBackend(Backend):
+             bool: :const:`True` if the backend has a result for the task,
+                 :const:`False` otherwise.
+         """
++        if self._is_task_forgotten(task_id):
++            return False
+         return bool(self.get(self.get_key_for_task(task_id)))
+ 
+     def _restore_group(self, group_id):
+diff --git a/celery/backends/database/__init__.py b/celery/backends/database/__init__.py
+index 330f6682b..08260e326 100644
+--- a/celery/backends/database/__init__.py
++++ b/celery/backends/database/__init__.py
+@@ -16,7 +16,9 @@ from .models import Task, TaskExtended, TaskSet
+ from .session import SessionManager
+ 
+ try:
+-    from sqlalchemy.exc import DatabaseError, InterfaceError, InvalidRequestError
++    from sqlalchemy.exc import (
++        DatabaseError, IntegrityError, InterfaceError, InvalidRequestError,
++    )
+     from sqlalchemy.orm.exc import StaleDataError
+ except ImportError:
+     raise ImproperlyConfigured(
+@@ -34,6 +36,12 @@ RETRYABLE_DB_ERRORS = (
+     StaleDataError,
+ )
+ 
++#: Internal status written by ``forget()``.  It is never exposed through
++#: the result API: ``_get_task_meta_for`` translates it back into plain
++#: ``PENDING`` and ``_store_result`` refuses to overwrite the boundary row
++#: until regular expiry cleanup removes it and the task id can be reused.
++_FORGOTTEN_STATUS = 'FORGOTTEN'
++
+ 
+ @contextmanager
+ def session_cleanup(session):
+@@ -136,22 +144,70 @@ class DatabaseBackend(BaseBackend):
+             short_lived_sessions=self.short_lived_sessions,
+             **self.engine_options)
+ 
++    def _locked_task(self, session, task_id):
++        """Return the stored task row, locking it where the dialect can."""
++        query = session.query(self.task_cls).filter(
++            self.task_cls.task_id == task_id)
++        if session.get_bind().dialect.name != 'sqlite':
++            # SQLite serializes writers database-wide anyway and silently
++            # ignores FOR UPDATE; other backends use the row lock so a
++            # concurrent forget()/store_result() pair is serialised.
++            query = query.with_for_update()
++        return query.first()
++
+     def _store_result(self, task_id, result, state, traceback=None,
+                       request=None, **kwargs):
+         """Store return value and state of an executed task."""
+         session = self.ResultSession()
+         with session_cleanup(session):
+-            task = list(session.query(self.task_cls).filter(self.task_cls.task_id == task_id))
+-            task = task and task[0]
+-            if not task:
++            task = self._locked_task(session, task_id)
++            if task is None:
+                 task = self.task_cls(task_id)
+                 task.task_id = task_id
+                 session.add(task)
+-                session.flush()
++                try:
++                    session.flush()
++                except IntegrityError:
++                    # A concurrent forget() won the insert race and the
++                    # unique task_id constraint now holds the boundary row.
++                    session.rollback()
++                    self._update_task_unless_forgotten(
++                        task_id, result, state, traceback, request)
++                    return
++
++            if task.status == _FORGOTTEN_STATUS:
++                # Persistent forget boundary: discard this (possibly
++                # terminal) state transition until cleanup expires it.
++                return
+ 
+             self._update_result(task, result, state, traceback=traceback, request=request)
+             session.commit()
+ 
++    def _update_task_unless_forgotten(self, task_id, result, state,
++                                      traceback, request):
++        """Second-chance update used after an insert race with forget()."""
++        session = self.ResultSession()
++        with session_cleanup(session):
++            task = self._locked_task(session, task_id)
++            if task is None or task.status == _FORGOTTEN_STATUS:
++                return
++            self._update_result(task, result, state,
++                                traceback=traceback, request=request)
++            session.commit()
++
++    def _set_task_forgotten(self, task):
++        """Turn an existing row into the internal forget boundary.
++
++        Every column that could carry task data is wiped so the boundary
++        row can never leak a result, traceback or extended request meta.
++        """
++        for column in self.task_cls.__table__.columns:
++            if column.name in ('id', 'task_id', 'status', 'date_done'):
++                continue
++            setattr(task, column.name, None)
++        task.status = _FORGOTTEN_STATUS
++        task.date_done = self.app.now()
++
+     def _update_result(self, task, result, state, traceback=None,
+                        request=None):
+ 
+@@ -181,6 +237,10 @@ class DatabaseBackend(BaseBackend):
+                 task = self.task_cls(task_id)
+                 task.status = states.PENDING
+                 task.result = None
++            elif task.status == _FORGOTTEN_STATUS:
++                # Persistent forget boundary: expose only plain PENDING,
++                # never the internal marker itself.
++                return {'status': states.PENDING, 'result': None}
+             data = task.to_dict()
+             data['result'] = self._decode_stored_result(data['result'])
+             if data.get('args', None) is not None:
+@@ -231,7 +291,9 @@ class DatabaseBackend(BaseBackend):
+         session = self.ResultSession()
+         with session_cleanup(session):
+             return session.query(self.task_cls).filter(
+-                self.task_cls.task_id == task_id
++                self.task_cls.task_id == task_id,
++                # the forget boundary row is not a visible task result
++                self.task_cls.status != _FORGOTTEN_STATUS,
+             ).first() is not None
+ 
+     def _save_group(self, group_id, result):
+@@ -269,10 +331,24 @@ class DatabaseBackend(BaseBackend):
+             session.commit()
+ 
+     def _forget(self, task_id):
+-        """Forget about result."""
++        """Forget about the result and persist the forget boundary.
++
++        Instead of just deleting the row, an internal boundary row is
++        upserted in the same transaction.  A terminal ``store_result``
++        racing or arriving afterwards is discarded, and reads keep
++        reporting ``PENDING``.  The row carries a fresh ``date_done`` so
++        regular expiry cleanup removes it after ``result_expires``, after
++        which the task id can store new results again.
++        """
+         session = self.ResultSession()
+         with session_cleanup(session):
+-            session.query(self.task_cls).filter(self.task_cls.task_id == task_id).delete()
++            task = self._locked_task(session, task_id)
++            if task is None:
++                task = self.task_cls(task_id)
++                task.task_id = task_id
++                session.add(task)
++                session.flush()
++            self._set_task_forgotten(task)
+             session.commit()
+ 
+     def cleanup(self):
+diff --git a/celery/backends/redis.py b/celery/backends/redis.py
+index 82b0c7ff8..df9ab4896 100644
+--- a/celery/backends/redis.py
++++ b/celery/backends/redis.py
+@@ -77,6 +77,28 @@ CERT_REQUIRED, CERT_OPTIONAL, or CERT_NONE
+ 
+ E_LOST = 'Connection to Redis lost: Retry (%s/%s) %s.'
+ 
++# Atomically store a task result while honouring a live forget boundary.
++#
++# KEYS[1] is the task meta key, KEYS[2] the forget-boundary marker key.
++# ARGV[1] is the encoded task meta, ARGV[2] the TTL in seconds (0 keeps
++# the key without expiry).  When the boundary exists the result is dropped
++# (and any result racing back in is deleted) and *nothing* is published,
++# so asynchronous subscribers cannot observe the discarded result either.
++_TASK_META_STORE_SCRIPT = """
++if redis.call('exists', KEYS[2]) == 1 then
++    redis.call('del', KEYS[1])
++    return 0
++end
++local ttl = tonumber(ARGV[2])
++if ttl and ttl > 0 then
++    redis.call('setex', KEYS[1], ttl, ARGV[1])
++else
++    redis.call('set', KEYS[1], ARGV[1])
++end
++redis.call('publish', KEYS[1], ARGV[1])
++return 1
++"""
++
+ logger = get_logger(__name__)
+ 
+ 
+@@ -86,6 +108,8 @@ class ResultConsumer(BaseResultConsumer):
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         self._get_key_for_task = self.backend.get_key_for_task
++        self._get_key_for_forgotten = self.backend.get_key_for_forgotten
++        self._strip_task_prefix = self.backend._strip_prefix
+         self._decode_result = self.backend.decode_result
+         self._ensure = self.backend.ensure
+         self._connection_errors = self.backend.connection_errors
+@@ -106,8 +130,19 @@ class ResultConsumer(BaseResultConsumer):
+         # task state might have changed when the connection was down so we
+         # retrieve meta for all subscribed tasks before going into pubsub mode
+         if self.subscribed_to:
+-            metas = self.backend.client.mget(self.subscribed_to)
+-            metas = [meta for meta in metas if meta]
++            keys = list(self.subscribed_to)
++            marker_keys = [
++                self._get_key_for_forgotten(self._strip_task_prefix(key))
++                for key in keys
++            ]
++            metas = self.backend.client.mget(keys)
++            forgotten = self.backend.client.mget(marker_keys)
++            metas = [
++                meta for meta, marker in zip(metas, forgotten)
++                # a task forgotten while the connection was down must not
++                # be resurrected for its subscribers.
++                if meta and not marker
++            ]
+             for meta in metas:
+                 self.on_state_change(self._decode_result(meta), None)
+         self._pubsub = self.backend.client.pubsub(
+@@ -183,7 +218,17 @@ class ResultConsumer(BaseResultConsumer):
+             with self.reconnect_on_error():
+                 message = self._pubsub.get_message(timeout=timeout)
+                 if message and message['type'] == 'message':
+-                    self.on_state_change(self._decode_result(message['data']), message)
++                    meta = self._decode_result(message['data'])
++                    if self.backend._is_task_forgotten(
++                            meta.get('task_id')):
++                        # The result was forgotten while this terminal
++                        # notification was already in flight: never resolve
++                        # waiters or buffer it.
++                        task_id = meta.get('task_id')
++                        if task_id:
++                            self.cancel_for(task_id)
++                        return
++                    self.on_state_change(meta, message)
+         elif timeout:
+             time.sleep(timeout)
+ 
+@@ -521,6 +566,28 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
+     def mget(self, keys):
+         return self.client.mget(keys)
+ 
++    def _get_task_meta_for(self, task_id):
++        """Get task meta-data for a task by id.
++
++        Reads the result and the forget-boundary marker in one round trip
++        so a forgotten task always looks like plain ``PENDING`` and a
++        terminal result written around the same time as :meth:`forget`
++        is removed instead of being exposed.
++        """
++        key = self.get_key_for_task(task_id)
++        if self.supports_persistent_forget:
++            marker_key = self.get_key_for_forgotten(task_id)
++            meta, forgotten = self.client.mget((key, marker_key))
++            if forgotten:
++                if meta is not None:
++                    self.client.delete(key)
++                return {'status': states.PENDING, 'result': None}
++        else:
++            meta = self.get(key)
++        if not meta:
++            return {'status': states.PENDING, 'result': None}
++        return self.decode_result(meta)
++
+     def ensure(self, fun, args, **policy):
+         retry_policy = dict(self.retry_policy, **policy)
+         max_retries = retry_policy.get('max_retries')
+@@ -551,9 +618,80 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
+             pipe.publish(key, value)
+             pipe.execute()
+ 
++    def _store_task_meta(self, task_id, encoded_meta, state):
++        """Write task meta atomically with the forget-boundary check.
++
++        A server-side Lua script makes the "no boundary → set + publish"
++        decision atomic, closing the window in which a terminal
++        ``store_result`` could resurrect a forgotten result or notify its
++        subscribers after :meth:`forget`.  Clients without Lua scripting
++        support (test doubles, minimal proxies) fall back to guarded
++        pipelines, which mask the same races with marker checks on both
++        sides of the write plus the subscriber-side guard.
++        """
++        key = self.get_key_for_task(task_id)
++        if not self.supports_persistent_forget:
++            self._set(key, encoded_meta)
++            return
++        marker_key = self.get_key_for_forgotten(task_id)
++        if self._server_side_scripts_available():
++            script = self.client.register_script(_TASK_META_STORE_SCRIPT)
++            ttl = int(self.expires) if self.expires else 0
++            # ``ensure`` applies the same connection-error retry policy the
++            # regular set() path uses; script() is called positionally so its
++            # arguments survive kombu's retry_over_time wrapping.
++            stored = self.ensure(
++                script, ([key, marker_key], [encoded_meta, ttl]))
++            if not stored:
++                # The forget boundary is live: the boundary marker itself is
++                # left untouched and carries its own expiry.
++                logger.debug(
++                    'Discarded result for forgotten task %r', task_id)
++        else:
++            self._store_task_meta_pipeline(key, marker_key, encoded_meta)
++
++    def _server_side_scripts_available(self):
++        # Detect support on the client *class*: mock instances advertise
++        # arbitrary attributes, but only a real redis-py client class
++        # defines register_script.
++        return callable(
++            getattr(type(self.client), 'register_script', None))
++
++    def _store_task_meta_pipeline(self, key, marker_key, value):
++        if self.get(marker_key) is not None:
++            self.client.delete(key)
++            return
++        self._set(key, value)
++        if self.get(marker_key) is not None:
++            # forget() landed between the check and the write.
++            self.client.delete(key)
++
++    def _forget(self, task_id):
++        """Persist the forget boundary then delete the task meta.
++
++        The marker expires with :setting:`result_expires`; until it does,
++        the store script discards late worker writes and reads keep
++        reporting ``PENDING``, also from other processes.
++        """
++        if not self.supports_persistent_forget:
++            self.delete(self.get_key_for_task(task_id))
++            return
++        marker_key = self.get_key_for_forgotten(task_id)
++        key = self.get_key_for_task(task_id)
++        with self.client.pipeline() as pipe:
++            if self.expires:
++                pipe.setex(marker_key, self.expires, self.forgotten_marker)
++            else:
++                pipe.set(marker_key, self.forgotten_marker)
++            pipe.delete(key)
++            pipe.execute()
++
+     def forget(self, task_id):
+         super().forget(task_id)
+         self.result_consumer.cancel_for(task_id)
++        # drop a terminal state that was consumed off the wire but not yet
++        # awaited, so it can't resolve a waiter after the forget.
++        self._discard_pending_message(task_id)
+ 
+     def delete(self, key):
+         self.client.delete(key)
+diff --git a/celery/backends/rpc.py b/celery/backends/rpc.py
+index 1b8f5a80b..9dc92e038 100644
+--- a/celery/backends/rpc.py
++++ b/celery/backends/rpc.py
+@@ -164,6 +164,9 @@ class RPCBackend(base.Backend, AsyncBackendMixin):
+     persistent = False
+     supports_autoexpire = True
+     supports_native_join = True
++    # results live on the reply queue, there is no persistent store in
++    # which a forget boundary could be kept.
++    supports_persistent_forget = False
+ 
+     retry_policy = {
+         'max_retries': 20,
+diff --git a/t/unit/backends/test_base.py b/t/unit/backends/test_base.py
+index 0f82090a8..320cd700b 100644
+--- a/t/unit/backends/test_base.py
++++ b/t/unit/backends/test_base.py
+@@ -1687,6 +1687,119 @@ class test_KeyValueStoreBackend:
+         self.b.forget(tid)
+         assert self.b.task_result_exists(tid) is False
+ 
++    def test_forget_persists_boundary_marker(self):
++        tid = uuid()
++        self.b.mark_as_done(tid, 'result')
++        self.b.forget(tid)
++        marker_key = self.b.get_key_for_forgotten(tid)
++        assert self.b.get(marker_key) == self.b.forgotten_marker
++        # the actual result key has been deleted
++        assert self.b.get(self.b.get_key_for_task(tid)) is None
++
++    def test_forget_then_late_terminal_store_stays_pending(self):
++        # The race this fixes: terminal store_result lands after forget.
++        tid = uuid()
++        self.b.mark_as_failure(tid, KeyError('boom'), traceback='tb-secret')
++        self.b.forget(tid)
++
++        # a late worker completion must not resurrect the result
++        self.b.mark_as_done(tid, 'late-result')
++
++        meta = self.b.get_task_meta(tid, cache=False)
++        assert meta == {'status': states.PENDING, 'result': None}
++        assert self.b.get_state(tid) == states.PENDING
++        assert self.b.get_result(tid) is None
++        assert self.b.get_traceback(tid) is None
++        assert self.b.get_children(tid) is None
++        assert self.b.task_result_exists(tid) is False
++
++    def test_late_store_with_traceback_and_children_does_not_leak(self):
++        tid = uuid()
++        request = Context(children=[])
++        self.b.forget(tid)
++        self.b.store_result(
++            tid, RuntimeError('late'), states.FAILURE,
++            traceback='late-traceback', request=request)
++        meta = self.b.get_task_meta(tid, cache=False)
++        assert meta == {'status': states.PENDING, 'result': None}
++        assert 'traceback' not in meta
++        assert 'children' not in meta
++
++    def test_forget_boundary_respected_by_second_backend_instance(self):
++        # emulates a new process connecting to the same key/value store
++        tid = uuid()
++        self.b.mark_as_done(tid, 'result')
++        self.b.forget(tid)
++
++        other = KVBackend(app=self.app)
++        other.db = self.b.db
++        assert other.get_state(tid) == states.PENDING
++        other.mark_as_done(tid, 'written-from-another-process')
++        assert other.get_state(tid) == states.PENDING
++        assert other.get_result(tid) is None
++
++    def test_boundary_expiry_allows_task_id_reuse(self):
++        tid = uuid()
++        self.b.mark_as_done(tid, 'first-run')
++        self.b.forget(tid)
++        assert self.b.get_state(tid) == states.PENDING
++
++        # emulate result_expires elapsing and cleanup of the marker
++        self.b.delete(self.b.get_key_for_forgotten(tid))
++
++        self.b.mark_as_done(tid, 'second-run')
++        assert self.b.get_state(tid) == states.SUCCESS
++        assert self.b.get_result(tid) == 'second-run'
++
++    def test_forget_failure_is_not_faked_and_can_be_retried(self):
++        tid = uuid()
++        self.b.mark_as_done(tid, 'result')
++
++        real_set = KVBackend._set_with_state
++        calls = {'n': 0}
++
++        def flaky_set(backend, key, value, state):
++            calls['n'] += 1
++            if calls['n'] == 1:
++                raise ConnectionError('backend unavailable')
++            return real_set(backend, key, value, state)
++
++        with patch.object(KVBackend, '_set_with_state', flaky_set):
++            with pytest.raises(ConnectionError):
++                self.b.forget(tid)
++            # result must not be reported gone while the boundary failed
++            assert self.b.task_result_exists(tid) is True
++            # retry once the backend recovered: completes the forget
++            self.b.forget(tid)
++
++        assert calls['n'] == 2
++        assert self.b.get_state(tid) == states.PENDING
++
++    def test_get_many_masks_forgotten_results(self):
++        forgotten, ready = uuid(), uuid()
++        self.b.mark_as_done(forgotten, 'forgotten-value')
++        self.b.mark_as_done(ready, 'ready-value')
++        self.b.forget(forgotten)
++        # resurrected late write, as a racing worker could produce
++        self.b.mark_as_done(forgotten, 'late-forgotten-value')
++
++        seen = dict(self.b.get_many(
++            [forgotten, ready], timeout=None, interval=0,
++            max_iterations=1))
++        assert ready in seen
++        assert forgotten not in seen
++
++    def test_disabled_persistent_forget_keeps_legacy_delete(self):
++        b = KVBackend(app=self.app)
++        b.supports_persistent_forget = False
++        tid = uuid()
++        b.mark_as_done(tid, 'result')
++        b.forget(tid)
++        assert b.get(b.get_key_for_forgotten(tid)) is None
++        # without a boundary a late store is visible, as in legacy behavior
++        b.mark_as_done(tid, 'late-result')
++        assert b.get_state(tid) == states.SUCCESS
++
+ 
+ class test_result_compression:
+ 
+diff --git a/t/unit/backends/test_database.py b/t/unit/backends/test_database.py
+index 7bf1b3f89..fda218119 100644
+--- a/t/unit/backends/test_database.py
++++ b/t/unit/backends/test_database.py
+@@ -641,6 +641,138 @@ class test_DatabaseBackend:
+         x.forget()
+         assert x.result is None
+ 
++    def test_forget_persists_boundary_and_masks_late_terminal_store(self):
++        from celery.backends.database import _FORGOTTEN_STATUS
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tid = uuid()
++        tb.mark_as_failure(tid, KeyError('boom'), traceback='tb-secret')
++        tb.forget(tid)
++
++        # the boundary row exists with the internal marker only
++        session = tb.ResultSession()
++        row = session.query(Task).filter(Task.task_id == tid).first()
++        assert row is not None
++        assert row.status == _FORGOTTEN_STATUS
++        assert row.result is None
++        assert row.traceback is None
++        assert row.date_done is not None
++        session.close()
++
++        # but only plain PENDING is exposed through the result API
++        assert tb.get_state(tid) == states.PENDING
++        assert tb.get_result(tid) is None
++        assert tb.get_traceback(tid) is None
++        assert tb.task_result_exists(tid) is False
++
++        # late worker terminal write must not resurrect the result
++        tb.mark_as_done(tid, 'late-result')
++        assert tb.get_state(tid) == states.PENDING
++        assert tb.get_result(tid) is None
++        tb.store_result(tid, RuntimeError('late'), states.FAILURE,
++                        traceback='late-tb')
++        assert tb.get_state(tid) == states.PENDING
++        assert tb.get_traceback(tid) is None
++
++    def test_forget_boundary_respected_by_new_backend_instance(self):
++        # emulates a new process connecting to the same database
++        tb = DatabaseBackend(self.uri, app=self.app)
++        other = DatabaseBackend(self.uri, app=self.app)
++        tid = uuid()
++        tb.mark_as_done(tid, 'result')
++        tb.forget(tid)
++
++        assert other.get_state(tid) == states.PENDING
++        other.mark_as_done(tid, 'from-another-process')
++        assert other.get_state(tid) == states.PENDING
++        assert other.get_result(tid) is None
++
++    def test_forget_boundary_expires_and_task_id_can_be_reused(self):
++        from datetime import timedelta
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tid = uuid()
++        tb.mark_as_done(tid, 'first-run')
++        tb.forget(tid)
++        assert tb.get_state(tid) == states.PENDING
++
++        # emulate result_expires elapsing before cleanup
++        session = tb.ResultSession()
++        session.query(Task).filter(Task.task_id == tid).update(
++            {'date_done': self.app.now() - timedelta(days=2)})
++        session.commit()
++        session.close()
++        tb.cleanup()
++
++        assert tb.task_result_exists(tid) is False
++        tb.mark_as_done(tid, 'second-run')
++        assert tb.get_state(tid) == states.SUCCESS
++        assert tb.get_result(tid) == 'second-run'
++
++    def test_forget_can_complete_after_failed_attempt(self):
++        from celery.backends.database import DatabaseError
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tid = uuid()
++        tb.mark_as_done(tid, 'result')
++
++        original_forget = tb._forget
++
++        def always_failing_forget(task_id):
++            raise DatabaseError('database down', None, None)
++
++        tb._forget = always_failing_forget
++        with pytest.raises(DatabaseError):
++            tb.forget(tid)
++        # exhausted retries must not have forgotten anything
++        assert tb.get_state(tid) == states.SUCCESS
++        assert tb.get_result(tid) == 'result'
++
++        # retry once the backend recovered completes the forget
++        tb._forget = original_forget
++        tb.forget(tid)
++        assert tb.get_state(tid) == states.PENDING
++
++    def test_store_loses_insert_race_against_forget_boundary(self):
++        from celery.backends.database import _FORGOTTEN_STATUS
++        from sqlalchemy.exc import IntegrityError
++        from sqlalchemy.orm import Session
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tid = uuid()
++        # a concurrent forget() has already committed the boundary row
++        tb._forget(tid)
++
++        # racing store reads a stale snapshot without the row, then its
++        # INSERT hits the unique constraint and must re-check and give up
++        real_locked = tb._locked_task
++        stale = [True]
++
++        def locked(session, task_id, _real=real_locked):
++            if stale[0]:
++                stale[0] = False
++                return None
++            return _real(session, task_id)
++
++        real_flush = Session.flush
++
++        def flush_raising_on_insert(session_self, *args, **kwargs):
++            # SQLAlchemy invokes flush() as an autoflush no-op on empty
++            # sessions too; only the actual INSERT must fail.
++            if session_self.new:
++                raise IntegrityError(
++                    'insert', {}, Exception('UNIQUE constraint'))
++            return real_flush(session_self, *args, **kwargs)
++
++        with patch.object(tb, '_locked_task', side_effect=locked):
++            with patch.object(
++                    Session, 'flush', autospec=True,
++                    side_effect=flush_raising_on_insert):
++                tb._store_result(tid, 'late', states.SUCCESS)
++
++        assert tb.get_state(tid) == states.PENDING
++        assert tb.get_result(tid) is None
++        row_session = tb.ResultSession()
++        row = row_session.query(Task).filter(Task.task_id == tid).first()
++        assert row.status == _FORGOTTEN_STATUS
++        row_session.close()
++
+     def test_process_cleanup(self):
+         tb = DatabaseBackend(self.uri, app=self.app)
+         tb.process_cleanup()
+@@ -748,6 +880,41 @@ class test_DatabaseBackend_result_extended():
+         assert meta['retries'] == 2
+         assert meta['worker'] == "celery@worker_1"
+ 
++    def test_forget_wipes_extended_request_fields(self):
++        from celery.backends.database import _FORGOTTEN_STATUS
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tid = uuid()
++        request = Context(args=(SomeClass(1),), kwargs={'foo': 'bar'},
++                          task='mytask', retries=2,
++                          hostname='celery@worker_1',
++                          delivery_info={'routing_key': 'celery'})
++        tb.store_result(tid, {'fizz': 'buzz'}, states.SUCCESS,
++                        request=request)
++
++        tb.forget(tid)
++
++        # nothing but PENDING is exposed through the result API
++        meta = tb.get_task_meta(tid, cache=False)
++        assert meta == {'status': states.PENDING, 'result': None}
++        assert 'args' not in meta and 'kwargs' not in meta
++        assert 'name' not in meta and 'worker' not in meta
++
++        # the boundary row itself keeps no request data
++        session = tb.ResultSession()
++        row = session.query(tb.task_cls).filter(
++            tb.task_cls.task_id == tid).first()
++        assert row.status == _FORGOTTEN_STATUS
++        assert row.result is None and row.traceback is None
++        assert row.name is None and row.args is None
++        assert row.kwargs is None and row.worker is None
++        assert row.retries is None and row.queue is None
++        session.close()
++
++        # a late write is suppressed as well
++        tb.store_result(tid, {'late': True}, states.SUCCESS,
++                        request=request)
++        assert tb.get_state(tid) == states.PENDING
++
+     @pytest.mark.parametrize(
+         'result_serializer, args, kwargs',
+         [
+diff --git a/t/unit/backends/test_redis.py b/t/unit/backends/test_redis.py
+index 8aee90abf..35f4ed278 100644
+--- a/t/unit/backends/test_redis.py
++++ b/t/unit/backends/test_redis.py
+@@ -293,6 +293,61 @@ class test_RedisResultConsumer:
+         consumer.cancel_for(task_id)
+         consumer._pubsub.unsubscribe.assert_not_called()
+ 
++    def test_drain_events_drops_terminal_message_after_forget(self):
++        # a terminal notification already in the socket buffer when
++        # forget() happens must never resolve a subscriber
++        consumer = self.get_consumer()
++        backend = consumer.backend
++        tid = uuid()
++        consumer.start(tid)
++        payload = backend.encode({
++            'task_id': tid, 'status': states.SUCCESS, 'result': 'secret'})
++        consumer._pubsub.get_message = Mock(return_value={
++            'type': 'message', 'data': payload})
++        backend.forget(tid)
++
++        consumer.drain_events()
++
++        assert tid not in backend._pending_messages
++        assert backend.get_state(tid) == states.PENDING
++
++    def test_drain_events_delivers_terminal_message_when_not_forgotten(self):
++        consumer = self.get_consumer()
++        backend = consumer.backend
++        tid = uuid()
++        consumer.start(tid)
++        payload = backend.encode({
++            'task_id': tid, 'status': states.SUCCESS, 'result': 42})
++        consumer._pubsub.get_message = Mock(return_value={
++            'type': 'message', 'data': payload})
++
++        consumer.drain_events()
++
++        buffered = backend._pending_messages.take(tid)
++        assert buffered['status'] == states.SUCCESS
++        assert buffered['result'] == 42
++
++    def test_reconnect_does_not_resurrect_forgotten_task(self):
++        consumer = self.get_consumer()
++        backend = consumer.backend
++        tid = uuid()
++        consumer.start(tid)
++        # racing terminal write still present in Redis when reconnecting
++        late_meta = json.dumps({
++            'task_id': tid, 'status': states.SUCCESS, 'result': 1})
++        backend.forget(tid)
++        backend._set_with_state(
++            backend.get_key_for_task(tid), late_meta, states.SUCCESS)
++        # forget() canceled the subscription locally; emulate another
++        # subscriber still waiting on the channel at reconnect time
++        consumer.subscribed_to = {backend.get_key_for_task(tid)}
++
++        with patch.object(consumer, 'on_state_change') as on_state_change:
++            consumer._reconnect_pubsub()
++
++        on_state_change.assert_not_called()
++        assert tid not in backend._pending_messages
++
+     @patch('celery.backends.redis.ResultConsumer.cancel_for')
+     @patch('celery.backends.asynchronous.BaseResultConsumer.on_state_change')
+     def test_drain_events_connection_error(self, parent_on_state_change, cancel_for):
+@@ -329,7 +384,12 @@ class test_RedisResultConsumer:
+         consumer.start('initial')
+         consumer.backend._set_with_state(b'celery-task-meta-initial', json.dumps(meta), states.SUCCESS)
+         consumer._reconnect_pubsub()
+-        consumer.backend.client.mget.assert_called_once()
++        # one mget for task metas, one for the forget-boundary markers
++        assert consumer.backend.client.mget.call_count == 2
++        consumer.backend.client.mget.assert_has_calls([
++            call([b'celery-task-meta-initial']),
++            call([b'celery-task-meta-initial.f']),
++        ])
+         consumer._pubsub.subscribe.assert_not_called()
+         consumer._pubsub.connection.register_connect_callback.assert_called_once()
+ 
+@@ -339,7 +399,7 @@ class test_RedisResultConsumer:
+         consumer.start('initial')
+         consumer.backend._set_with_state(b'celery-task-meta-initial', json.dumps(meta), states.SUCCESS)
+         consumer._reconnect_pubsub()
+-        consumer.backend.client.mget.assert_called_once()
++        assert consumer.backend.client.mget.call_count == 2
+         consumer._pubsub.subscribe.assert_called_once()
+         consumer._pubsub.connection.register_connect_callback.assert_not_called()
+ 
+@@ -1243,6 +1303,119 @@ class test_RedisBackend(basetest_RedisBackend):
+         self.b.forget(tid)
+         assert self.b.get_state(tid) == states.PENDING
+ 
++    def test_forget_persists_expiring_boundary_marker(self):
++        tid = uuid()
++        result_key = self.b.get_key_for_task(tid)
++        marker_key = self.b.get_key_for_forgotten(tid)
++        self.b.store_result(tid, 42, states.SUCCESS)
++        self.b.forget(tid)
++
++        assert self.b.client.keyspace[marker_key] == \
++            self.b.forgotten_marker
++        assert self.b.client.expiry[marker_key] == self.b.expires
++        assert result_key not in self.b.client.keyspace
++        assert self.b.get_state(tid) == states.PENDING
++        # the internal marker never surfaces through task meta
++        assert self.b.get_task_meta(tid, cache=False) == \
++            {'status': states.PENDING, 'result': None}
++
++    def test_late_store_after_forget_is_discarded(self):
++        tid = uuid()
++        result_key = self.b.get_key_for_task(tid)
++        self.b.store_result(tid, 42, states.SUCCESS)
++        self.b.forget(tid)
++
++        # the worker's terminal write landing after forget()
++        self.b.store_result(tid, 'late', states.SUCCESS)
++
++        assert self.b.get_state(tid) == states.PENDING
++        assert self.b.get_result(tid) is None
++        assert self.b.get_traceback(tid) is None
++        assert result_key not in self.b.client.keyspace
++        assert self.b.task_result_exists(tid) is False
++
++    def test_forget_before_any_result_blocks_late_terminal_store(self):
++        tid = uuid()
++        self.b.forget(tid)
++        self.b.store_result(tid, 'done', states.SUCCESS)
++        assert self.b.get_state(tid) == states.PENDING
++        assert self.b.get_result(tid) is None
++
++    def test_forget_boundary_respected_by_other_backend_instance(self):
++        # another process connecting to the same Redis
++        tid = uuid()
++        self.b.store_result(tid, 42, states.SUCCESS)
++        self.b.forget(tid)
++
++        other = self.Backend(app=self.app)
++        other.client.keyspace = self.b.client.keyspace
++        other.client.expiry = self.b.client.expiry
++        assert other.get_state(tid) == states.PENDING
++        other.store_result(tid, 'from-other-process', states.SUCCESS)
++        assert other.get_state(tid) == states.PENDING
++        assert other.get_result(tid) is None
++
++    def test_boundary_expiry_allows_task_id_reuse(self):
++        tid = uuid()
++        self.b.store_result(tid, 'first', states.SUCCESS)
++        self.b.forget(tid)
++        # emulate the marker expiring via Redis TTL
++        self.b.client.keyspace.pop(self.b.get_key_for_forgotten(tid))
++
++        self.b.store_result(tid, 'second', states.SUCCESS)
++        assert self.b.get_state(tid) == states.SUCCESS
++        assert self.b.get_result(tid) == 'second'
++
++    def test_forget_failure_is_not_faked(self):
++        tid = uuid()
++        self.b.store_result(tid, 42, states.SUCCESS)
++        result_key = self.b.get_key_for_task(tid)
++        marker_key = self.b.get_key_for_forgotten(tid)
++
++        # the boundary write itself fails: nothing must look forgotten
++        with patch.object(
++                self.b.client, 'setex',
++                side_effect=ConnectionError('redis down')):
++            with pytest.raises(Exception):
++                self.b.forget(tid)
++        assert marker_key not in self.b.client.keyspace
++        assert result_key in self.b.client.keyspace
++        assert self.b.task_result_exists(tid) is True
++
++        # retry once the backend recovered completes the forget
++        self.b.forget(tid)
++        assert self.b.get_state(tid) == states.PENDING
++        assert marker_key in self.b.client.keyspace
++
++    def test_forget_discards_buffered_pending_message(self):
++        from celery.utils.collections import BufferMap
++        tid = uuid()
++        self.b._pending_messages = BufferMap(10)
++        self.b._pending_messages.put(tid, {'status': states.SUCCESS})
++        self.b.result_consumer.cancel_for = Mock(name='cancel_for')
++
++        self.b.forget(tid)
++
++        assert tid not in self.b._pending_messages
++        self.b.result_consumer.cancel_for.assert_called_once_with(tid)
++
++    def test_persistent_forget_disabled_keeps_legacy_behavior(self):
++        b = self.Backend(app=self.app)
++        b.supports_persistent_forget = False
++        tid = uuid()
++        b.store_result(tid, 1, states.SUCCESS)
++        b.forget(tid)
++        assert b.get_key_for_forgotten(tid) not in b.client.keyspace
++        b.store_result(tid, 2, states.SUCCESS)
++        assert b.get_state(tid) == states.SUCCESS
++
++    def test_server_side_scripts_detected_on_client_class(self):
++        # the fake client is a Mock instance (arbitrary attrs allowed);
++        # support must be detected on the class, not the instance
++        assert self.b._server_side_scripts_available() is False
++        from redis import StrictRedis
++        assert hasattr(StrictRedis, 'register_script')
++
+     def test_set_expires(self):
+         self.b = self.Backend(expires=512, app=self.app)
+         tid = uuid()

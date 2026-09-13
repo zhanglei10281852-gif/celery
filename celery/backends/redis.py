@@ -77,6 +77,28 @@ CERT_REQUIRED, CERT_OPTIONAL, or CERT_NONE
 
 E_LOST = 'Connection to Redis lost: Retry (%s/%s) %s.'
 
+# Atomically store a task result while honouring a live forget boundary.
+#
+# KEYS[1] is the task meta key, KEYS[2] the forget-boundary marker key.
+# ARGV[1] is the encoded task meta, ARGV[2] the TTL in seconds (0 keeps
+# the key without expiry).  When the boundary exists the result is dropped
+# (and any result racing back in is deleted) and *nothing* is published,
+# so asynchronous subscribers cannot observe the discarded result either.
+_TASK_META_STORE_SCRIPT = """
+if redis.call('exists', KEYS[2]) == 1 then
+    redis.call('del', KEYS[1])
+    return 0
+end
+local ttl = tonumber(ARGV[2])
+if ttl and ttl > 0 then
+    redis.call('setex', KEYS[1], ttl, ARGV[1])
+else
+    redis.call('set', KEYS[1], ARGV[1])
+end
+redis.call('publish', KEYS[1], ARGV[1])
+return 1
+"""
+
 logger = get_logger(__name__)
 
 
@@ -86,6 +108,8 @@ class ResultConsumer(BaseResultConsumer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._get_key_for_task = self.backend.get_key_for_task
+        self._get_key_for_forgotten = self.backend.get_key_for_forgotten
+        self._strip_task_prefix = self.backend._strip_prefix
         self._decode_result = self.backend.decode_result
         self._ensure = self.backend.ensure
         self._connection_errors = self.backend.connection_errors
@@ -106,8 +130,19 @@ class ResultConsumer(BaseResultConsumer):
         # task state might have changed when the connection was down so we
         # retrieve meta for all subscribed tasks before going into pubsub mode
         if self.subscribed_to:
-            metas = self.backend.client.mget(self.subscribed_to)
-            metas = [meta for meta in metas if meta]
+            keys = list(self.subscribed_to)
+            marker_keys = [
+                self._get_key_for_forgotten(self._strip_task_prefix(key))
+                for key in keys
+            ]
+            metas = self.backend.client.mget(keys)
+            forgotten = self.backend.client.mget(marker_keys)
+            metas = [
+                meta for meta, marker in zip(metas, forgotten)
+                # a task forgotten while the connection was down must not
+                # be resurrected for its subscribers.
+                if meta and not marker
+            ]
             for meta in metas:
                 self.on_state_change(self._decode_result(meta), None)
         self._pubsub = self.backend.client.pubsub(
@@ -183,7 +218,17 @@ class ResultConsumer(BaseResultConsumer):
             with self.reconnect_on_error():
                 message = self._pubsub.get_message(timeout=timeout)
                 if message and message['type'] == 'message':
-                    self.on_state_change(self._decode_result(message['data']), message)
+                    meta = self._decode_result(message['data'])
+                    if self.backend._is_task_forgotten(
+                            meta.get('task_id')):
+                        # The result was forgotten while this terminal
+                        # notification was already in flight: never resolve
+                        # waiters or buffer it.
+                        task_id = meta.get('task_id')
+                        if task_id:
+                            self.cancel_for(task_id)
+                        return
+                    self.on_state_change(meta, message)
         elif timeout:
             time.sleep(timeout)
 
@@ -521,6 +566,28 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
     def mget(self, keys):
         return self.client.mget(keys)
 
+    def _get_task_meta_for(self, task_id):
+        """Get task meta-data for a task by id.
+
+        Reads the result and the forget-boundary marker in one round trip
+        so a forgotten task always looks like plain ``PENDING`` and a
+        terminal result written around the same time as :meth:`forget`
+        is removed instead of being exposed.
+        """
+        key = self.get_key_for_task(task_id)
+        if self.supports_persistent_forget:
+            marker_key = self.get_key_for_forgotten(task_id)
+            meta, forgotten = self.client.mget((key, marker_key))
+            if forgotten:
+                if meta is not None:
+                    self.client.delete(key)
+                return {'status': states.PENDING, 'result': None}
+        else:
+            meta = self.get(key)
+        if not meta:
+            return {'status': states.PENDING, 'result': None}
+        return self.decode_result(meta)
+
     def ensure(self, fun, args, **policy):
         retry_policy = dict(self.retry_policy, **policy)
         max_retries = retry_policy.get('max_retries')
@@ -551,9 +618,80 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
             pipe.publish(key, value)
             pipe.execute()
 
+    def _store_task_meta(self, task_id, encoded_meta, state):
+        """Write task meta atomically with the forget-boundary check.
+
+        A server-side Lua script makes the "no boundary → set + publish"
+        decision atomic, closing the window in which a terminal
+        ``store_result`` could resurrect a forgotten result or notify its
+        subscribers after :meth:`forget`.  Clients without Lua scripting
+        support (test doubles, minimal proxies) fall back to guarded
+        pipelines, which mask the same races with marker checks on both
+        sides of the write plus the subscriber-side guard.
+        """
+        key = self.get_key_for_task(task_id)
+        if not self.supports_persistent_forget:
+            self._set(key, encoded_meta)
+            return
+        marker_key = self.get_key_for_forgotten(task_id)
+        if self._server_side_scripts_available():
+            script = self.client.register_script(_TASK_META_STORE_SCRIPT)
+            ttl = int(self.expires) if self.expires else 0
+            # ``ensure`` applies the same connection-error retry policy the
+            # regular set() path uses; script() is called positionally so its
+            # arguments survive kombu's retry_over_time wrapping.
+            stored = self.ensure(
+                script, ([key, marker_key], [encoded_meta, ttl]))
+            if not stored:
+                # The forget boundary is live: the boundary marker itself is
+                # left untouched and carries its own expiry.
+                logger.debug(
+                    'Discarded result for forgotten task %r', task_id)
+        else:
+            self._store_task_meta_pipeline(key, marker_key, encoded_meta)
+
+    def _server_side_scripts_available(self):
+        # Detect support on the client *class*: mock instances advertise
+        # arbitrary attributes, but only a real redis-py client class
+        # defines register_script.
+        return callable(
+            getattr(type(self.client), 'register_script', None))
+
+    def _store_task_meta_pipeline(self, key, marker_key, value):
+        if self.get(marker_key) is not None:
+            self.client.delete(key)
+            return
+        self._set(key, value)
+        if self.get(marker_key) is not None:
+            # forget() landed between the check and the write.
+            self.client.delete(key)
+
+    def _forget(self, task_id):
+        """Persist the forget boundary then delete the task meta.
+
+        The marker expires with :setting:`result_expires`; until it does,
+        the store script discards late worker writes and reads keep
+        reporting ``PENDING``, also from other processes.
+        """
+        if not self.supports_persistent_forget:
+            self.delete(self.get_key_for_task(task_id))
+            return
+        marker_key = self.get_key_for_forgotten(task_id)
+        key = self.get_key_for_task(task_id)
+        with self.client.pipeline() as pipe:
+            if self.expires:
+                pipe.setex(marker_key, self.expires, self.forgotten_marker)
+            else:
+                pipe.set(marker_key, self.forgotten_marker)
+            pipe.delete(key)
+            pipe.execute()
+
     def forget(self, task_id):
         super().forget(task_id)
         self.result_consumer.cancel_for(task_id)
+        # drop a terminal state that was consumed off the wire but not yet
+        # awaited, so it can't resolve a waiter after the forget.
+        self._discard_pending_message(task_id)
 
     def delete(self, key):
         self.client.delete(key)

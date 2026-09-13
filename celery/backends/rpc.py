@@ -164,6 +164,9 @@ class RPCBackend(base.Backend, AsyncBackendMixin):
     persistent = False
     supports_autoexpire = True
     supports_native_join = True
+    # results live on the reply queue, there is no persistent store in
+    # which a forget boundary could be kept.
+    supports_persistent_forget = False
 
     retry_policy = {
         'max_retries': 20,

@@ -16,7 +16,9 @@ from .models import Task, TaskExtended, TaskSet
 from .session import SessionManager
 
 try:
-    from sqlalchemy.exc import DatabaseError, InterfaceError, InvalidRequestError
+    from sqlalchemy.exc import (
+        DatabaseError, IntegrityError, InterfaceError, InvalidRequestError,
+    )
     from sqlalchemy.orm.exc import StaleDataError
 except ImportError:
     raise ImproperlyConfigured(
@@ -33,6 +35,12 @@ RETRYABLE_DB_ERRORS = (
     InvalidRequestError,
     StaleDataError,
 )
+
+#: Internal status written by ``forget()``.  It is never exposed through
+#: the result API: ``_get_task_meta_for`` translates it back into plain
+#: ``PENDING`` and ``_store_result`` refuses to overwrite the boundary row
+#: until regular expiry cleanup removes it and the task id can be reused.
+_FORGOTTEN_STATUS = 'FORGOTTEN'
 
 
 @contextmanager
@@ -136,21 +144,69 @@ class DatabaseBackend(BaseBackend):
             short_lived_sessions=self.short_lived_sessions,
             **self.engine_options)
 
+    def _locked_task(self, session, task_id):
+        """Return the stored task row, locking it where the dialect can."""
+        query = session.query(self.task_cls).filter(
+            self.task_cls.task_id == task_id)
+        if session.get_bind().dialect.name != 'sqlite':
+            # SQLite serializes writers database-wide anyway and silently
+            # ignores FOR UPDATE; other backends use the row lock so a
+            # concurrent forget()/store_result() pair is serialised.
+            query = query.with_for_update()
+        return query.first()
+
     def _store_result(self, task_id, result, state, traceback=None,
                       request=None, **kwargs):
         """Store return value and state of an executed task."""
         session = self.ResultSession()
         with session_cleanup(session):
-            task = list(session.query(self.task_cls).filter(self.task_cls.task_id == task_id))
-            task = task and task[0]
-            if not task:
+            task = self._locked_task(session, task_id)
+            if task is None:
                 task = self.task_cls(task_id)
                 task.task_id = task_id
                 session.add(task)
-                session.flush()
+                try:
+                    session.flush()
+                except IntegrityError:
+                    # A concurrent forget() won the insert race and the
+                    # unique task_id constraint now holds the boundary row.
+                    session.rollback()
+                    self._update_task_unless_forgotten(
+                        task_id, result, state, traceback, request)
+                    return
+
+            if task.status == _FORGOTTEN_STATUS:
+                # Persistent forget boundary: discard this (possibly
+                # terminal) state transition until cleanup expires it.
+                return
 
             self._update_result(task, result, state, traceback=traceback, request=request)
             session.commit()
+
+    def _update_task_unless_forgotten(self, task_id, result, state,
+                                      traceback, request):
+        """Second-chance update used after an insert race with forget()."""
+        session = self.ResultSession()
+        with session_cleanup(session):
+            task = self._locked_task(session, task_id)
+            if task is None or task.status == _FORGOTTEN_STATUS:
+                return
+            self._update_result(task, result, state,
+                                traceback=traceback, request=request)
+            session.commit()
+
+    def _set_task_forgotten(self, task):
+        """Turn an existing row into the internal forget boundary.
+
+        Every column that could carry task data is wiped so the boundary
+        row can never leak a result, traceback or extended request meta.
+        """
+        for column in self.task_cls.__table__.columns:
+            if column.name in ('id', 'task_id', 'status', 'date_done'):
+                continue
+            setattr(task, column.name, None)
+        task.status = _FORGOTTEN_STATUS
+        task.date_done = self.app.now()
 
     def _update_result(self, task, result, state, traceback=None,
                        request=None):
@@ -181,6 +237,10 @@ class DatabaseBackend(BaseBackend):
                 task = self.task_cls(task_id)
                 task.status = states.PENDING
                 task.result = None
+            elif task.status == _FORGOTTEN_STATUS:
+                # Persistent forget boundary: expose only plain PENDING,
+                # never the internal marker itself.
+                return {'status': states.PENDING, 'result': None}
             data = task.to_dict()
             data['result'] = self._decode_stored_result(data['result'])
             if data.get('args', None) is not None:
@@ -231,7 +291,9 @@ class DatabaseBackend(BaseBackend):
         session = self.ResultSession()
         with session_cleanup(session):
             return session.query(self.task_cls).filter(
-                self.task_cls.task_id == task_id
+                self.task_cls.task_id == task_id,
+                # the forget boundary row is not a visible task result
+                self.task_cls.status != _FORGOTTEN_STATUS,
             ).first() is not None
 
     def _save_group(self, group_id, result):
@@ -269,10 +331,24 @@ class DatabaseBackend(BaseBackend):
             session.commit()
 
     def _forget(self, task_id):
-        """Forget about result."""
+        """Forget about the result and persist the forget boundary.
+
+        Instead of just deleting the row, an internal boundary row is
+        upserted in the same transaction.  A terminal ``store_result``
+        racing or arriving afterwards is discarded, and reads keep
+        reporting ``PENDING``.  The row carries a fresh ``date_done`` so
+        regular expiry cleanup removes it after ``result_expires``, after
+        which the task id can store new results again.
+        """
         session = self.ResultSession()
         with session_cleanup(session):
-            session.query(self.task_cls).filter(self.task_cls.task_id == task_id).delete()
+            task = self._locked_task(session, task_id)
+            if task is None:
+                task = self.task_cls(task_id)
+                task.task_id = task_id
+                session.add(task)
+                session.flush()
+            self._set_task_forgotten(task)
             session.commit()
 
     def cleanup(self):

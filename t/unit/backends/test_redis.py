@@ -293,6 +293,61 @@ class test_RedisResultConsumer:
         consumer.cancel_for(task_id)
         consumer._pubsub.unsubscribe.assert_not_called()
 
+    def test_drain_events_drops_terminal_message_after_forget(self):
+        # a terminal notification already in the socket buffer when
+        # forget() happens must never resolve a subscriber
+        consumer = self.get_consumer()
+        backend = consumer.backend
+        tid = uuid()
+        consumer.start(tid)
+        payload = backend.encode({
+            'task_id': tid, 'status': states.SUCCESS, 'result': 'secret'})
+        consumer._pubsub.get_message = Mock(return_value={
+            'type': 'message', 'data': payload})
+        backend.forget(tid)
+
+        consumer.drain_events()
+
+        assert tid not in backend._pending_messages
+        assert backend.get_state(tid) == states.PENDING
+
+    def test_drain_events_delivers_terminal_message_when_not_forgotten(self):
+        consumer = self.get_consumer()
+        backend = consumer.backend
+        tid = uuid()
+        consumer.start(tid)
+        payload = backend.encode({
+            'task_id': tid, 'status': states.SUCCESS, 'result': 42})
+        consumer._pubsub.get_message = Mock(return_value={
+            'type': 'message', 'data': payload})
+
+        consumer.drain_events()
+
+        buffered = backend._pending_messages.take(tid)
+        assert buffered['status'] == states.SUCCESS
+        assert buffered['result'] == 42
+
+    def test_reconnect_does_not_resurrect_forgotten_task(self):
+        consumer = self.get_consumer()
+        backend = consumer.backend
+        tid = uuid()
+        consumer.start(tid)
+        # racing terminal write still present in Redis when reconnecting
+        late_meta = json.dumps({
+            'task_id': tid, 'status': states.SUCCESS, 'result': 1})
+        backend.forget(tid)
+        backend._set_with_state(
+            backend.get_key_for_task(tid), late_meta, states.SUCCESS)
+        # forget() canceled the subscription locally; emulate another
+        # subscriber still waiting on the channel at reconnect time
+        consumer.subscribed_to = {backend.get_key_for_task(tid)}
+
+        with patch.object(consumer, 'on_state_change') as on_state_change:
+            consumer._reconnect_pubsub()
+
+        on_state_change.assert_not_called()
+        assert tid not in backend._pending_messages
+
     @patch('celery.backends.redis.ResultConsumer.cancel_for')
     @patch('celery.backends.asynchronous.BaseResultConsumer.on_state_change')
     def test_drain_events_connection_error(self, parent_on_state_change, cancel_for):
@@ -329,7 +384,12 @@ class test_RedisResultConsumer:
         consumer.start('initial')
         consumer.backend._set_with_state(b'celery-task-meta-initial', json.dumps(meta), states.SUCCESS)
         consumer._reconnect_pubsub()
-        consumer.backend.client.mget.assert_called_once()
+        # one mget for task metas, one for the forget-boundary markers
+        assert consumer.backend.client.mget.call_count == 2
+        consumer.backend.client.mget.assert_has_calls([
+            call([b'celery-task-meta-initial']),
+            call([b'celery-task-meta-initial.f']),
+        ])
         consumer._pubsub.subscribe.assert_not_called()
         consumer._pubsub.connection.register_connect_callback.assert_called_once()
 
@@ -339,7 +399,7 @@ class test_RedisResultConsumer:
         consumer.start('initial')
         consumer.backend._set_with_state(b'celery-task-meta-initial', json.dumps(meta), states.SUCCESS)
         consumer._reconnect_pubsub()
-        consumer.backend.client.mget.assert_called_once()
+        assert consumer.backend.client.mget.call_count == 2
         consumer._pubsub.subscribe.assert_called_once()
         consumer._pubsub.connection.register_connect_callback.assert_not_called()
 
@@ -1242,6 +1302,119 @@ class test_RedisBackend(basetest_RedisBackend):
         assert self.b.get_result(tid) == 42
         self.b.forget(tid)
         assert self.b.get_state(tid) == states.PENDING
+
+    def test_forget_persists_expiring_boundary_marker(self):
+        tid = uuid()
+        result_key = self.b.get_key_for_task(tid)
+        marker_key = self.b.get_key_for_forgotten(tid)
+        self.b.store_result(tid, 42, states.SUCCESS)
+        self.b.forget(tid)
+
+        assert self.b.client.keyspace[marker_key] == \
+            self.b.forgotten_marker
+        assert self.b.client.expiry[marker_key] == self.b.expires
+        assert result_key not in self.b.client.keyspace
+        assert self.b.get_state(tid) == states.PENDING
+        # the internal marker never surfaces through task meta
+        assert self.b.get_task_meta(tid, cache=False) == \
+            {'status': states.PENDING, 'result': None}
+
+    def test_late_store_after_forget_is_discarded(self):
+        tid = uuid()
+        result_key = self.b.get_key_for_task(tid)
+        self.b.store_result(tid, 42, states.SUCCESS)
+        self.b.forget(tid)
+
+        # the worker's terminal write landing after forget()
+        self.b.store_result(tid, 'late', states.SUCCESS)
+
+        assert self.b.get_state(tid) == states.PENDING
+        assert self.b.get_result(tid) is None
+        assert self.b.get_traceback(tid) is None
+        assert result_key not in self.b.client.keyspace
+        assert self.b.task_result_exists(tid) is False
+
+    def test_forget_before_any_result_blocks_late_terminal_store(self):
+        tid = uuid()
+        self.b.forget(tid)
+        self.b.store_result(tid, 'done', states.SUCCESS)
+        assert self.b.get_state(tid) == states.PENDING
+        assert self.b.get_result(tid) is None
+
+    def test_forget_boundary_respected_by_other_backend_instance(self):
+        # another process connecting to the same Redis
+        tid = uuid()
+        self.b.store_result(tid, 42, states.SUCCESS)
+        self.b.forget(tid)
+
+        other = self.Backend(app=self.app)
+        other.client.keyspace = self.b.client.keyspace
+        other.client.expiry = self.b.client.expiry
+        assert other.get_state(tid) == states.PENDING
+        other.store_result(tid, 'from-other-process', states.SUCCESS)
+        assert other.get_state(tid) == states.PENDING
+        assert other.get_result(tid) is None
+
+    def test_boundary_expiry_allows_task_id_reuse(self):
+        tid = uuid()
+        self.b.store_result(tid, 'first', states.SUCCESS)
+        self.b.forget(tid)
+        # emulate the marker expiring via Redis TTL
+        self.b.client.keyspace.pop(self.b.get_key_for_forgotten(tid))
+
+        self.b.store_result(tid, 'second', states.SUCCESS)
+        assert self.b.get_state(tid) == states.SUCCESS
+        assert self.b.get_result(tid) == 'second'
+
+    def test_forget_failure_is_not_faked(self):
+        tid = uuid()
+        self.b.store_result(tid, 42, states.SUCCESS)
+        result_key = self.b.get_key_for_task(tid)
+        marker_key = self.b.get_key_for_forgotten(tid)
+
+        # the boundary write itself fails: nothing must look forgotten
+        with patch.object(
+                self.b.client, 'setex',
+                side_effect=ConnectionError('redis down')):
+            with pytest.raises(Exception):
+                self.b.forget(tid)
+        assert marker_key not in self.b.client.keyspace
+        assert result_key in self.b.client.keyspace
+        assert self.b.task_result_exists(tid) is True
+
+        # retry once the backend recovered completes the forget
+        self.b.forget(tid)
+        assert self.b.get_state(tid) == states.PENDING
+        assert marker_key in self.b.client.keyspace
+
+    def test_forget_discards_buffered_pending_message(self):
+        from celery.utils.collections import BufferMap
+        tid = uuid()
+        self.b._pending_messages = BufferMap(10)
+        self.b._pending_messages.put(tid, {'status': states.SUCCESS})
+        self.b.result_consumer.cancel_for = Mock(name='cancel_for')
+
+        self.b.forget(tid)
+
+        assert tid not in self.b._pending_messages
+        self.b.result_consumer.cancel_for.assert_called_once_with(tid)
+
+    def test_persistent_forget_disabled_keeps_legacy_behavior(self):
+        b = self.Backend(app=self.app)
+        b.supports_persistent_forget = False
+        tid = uuid()
+        b.store_result(tid, 1, states.SUCCESS)
+        b.forget(tid)
+        assert b.get_key_for_forgotten(tid) not in b.client.keyspace
+        b.store_result(tid, 2, states.SUCCESS)
+        assert b.get_state(tid) == states.SUCCESS
+
+    def test_server_side_scripts_detected_on_client_class(self):
+        # the fake client is a Mock instance (arbitrary attrs allowed);
+        # support must be detected on the class, not the instance
+        assert self.b._server_side_scripts_available() is False
+        from redis import StrictRedis
+        assert hasattr(StrictRedis, 'register_script')
 
     def test_set_expires(self):
         self.b = self.Backend(expires=512, app=self.app)

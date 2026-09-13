@@ -1687,6 +1687,119 @@ class test_KeyValueStoreBackend:
         self.b.forget(tid)
         assert self.b.task_result_exists(tid) is False
 
+    def test_forget_persists_boundary_marker(self):
+        tid = uuid()
+        self.b.mark_as_done(tid, 'result')
+        self.b.forget(tid)
+        marker_key = self.b.get_key_for_forgotten(tid)
+        assert self.b.get(marker_key) == self.b.forgotten_marker
+        # the actual result key has been deleted
+        assert self.b.get(self.b.get_key_for_task(tid)) is None
+
+    def test_forget_then_late_terminal_store_stays_pending(self):
+        # The race this fixes: terminal store_result lands after forget.
+        tid = uuid()
+        self.b.mark_as_failure(tid, KeyError('boom'), traceback='tb-secret')
+        self.b.forget(tid)
+
+        # a late worker completion must not resurrect the result
+        self.b.mark_as_done(tid, 'late-result')
+
+        meta = self.b.get_task_meta(tid, cache=False)
+        assert meta == {'status': states.PENDING, 'result': None}
+        assert self.b.get_state(tid) == states.PENDING
+        assert self.b.get_result(tid) is None
+        assert self.b.get_traceback(tid) is None
+        assert self.b.get_children(tid) is None
+        assert self.b.task_result_exists(tid) is False
+
+    def test_late_store_with_traceback_and_children_does_not_leak(self):
+        tid = uuid()
+        request = Context(children=[])
+        self.b.forget(tid)
+        self.b.store_result(
+            tid, RuntimeError('late'), states.FAILURE,
+            traceback='late-traceback', request=request)
+        meta = self.b.get_task_meta(tid, cache=False)
+        assert meta == {'status': states.PENDING, 'result': None}
+        assert 'traceback' not in meta
+        assert 'children' not in meta
+
+    def test_forget_boundary_respected_by_second_backend_instance(self):
+        # emulates a new process connecting to the same key/value store
+        tid = uuid()
+        self.b.mark_as_done(tid, 'result')
+        self.b.forget(tid)
+
+        other = KVBackend(app=self.app)
+        other.db = self.b.db
+        assert other.get_state(tid) == states.PENDING
+        other.mark_as_done(tid, 'written-from-another-process')
+        assert other.get_state(tid) == states.PENDING
+        assert other.get_result(tid) is None
+
+    def test_boundary_expiry_allows_task_id_reuse(self):
+        tid = uuid()
+        self.b.mark_as_done(tid, 'first-run')
+        self.b.forget(tid)
+        assert self.b.get_state(tid) == states.PENDING
+
+        # emulate result_expires elapsing and cleanup of the marker
+        self.b.delete(self.b.get_key_for_forgotten(tid))
+
+        self.b.mark_as_done(tid, 'second-run')
+        assert self.b.get_state(tid) == states.SUCCESS
+        assert self.b.get_result(tid) == 'second-run'
+
+    def test_forget_failure_is_not_faked_and_can_be_retried(self):
+        tid = uuid()
+        self.b.mark_as_done(tid, 'result')
+
+        real_set = KVBackend._set_with_state
+        calls = {'n': 0}
+
+        def flaky_set(backend, key, value, state):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise ConnectionError('backend unavailable')
+            return real_set(backend, key, value, state)
+
+        with patch.object(KVBackend, '_set_with_state', flaky_set):
+            with pytest.raises(ConnectionError):
+                self.b.forget(tid)
+            # result must not be reported gone while the boundary failed
+            assert self.b.task_result_exists(tid) is True
+            # retry once the backend recovered: completes the forget
+            self.b.forget(tid)
+
+        assert calls['n'] == 2
+        assert self.b.get_state(tid) == states.PENDING
+
+    def test_get_many_masks_forgotten_results(self):
+        forgotten, ready = uuid(), uuid()
+        self.b.mark_as_done(forgotten, 'forgotten-value')
+        self.b.mark_as_done(ready, 'ready-value')
+        self.b.forget(forgotten)
+        # resurrected late write, as a racing worker could produce
+        self.b.mark_as_done(forgotten, 'late-forgotten-value')
+
+        seen = dict(self.b.get_many(
+            [forgotten, ready], timeout=None, interval=0,
+            max_iterations=1))
+        assert ready in seen
+        assert forgotten not in seen
+
+    def test_disabled_persistent_forget_keeps_legacy_delete(self):
+        b = KVBackend(app=self.app)
+        b.supports_persistent_forget = False
+        tid = uuid()
+        b.mark_as_done(tid, 'result')
+        b.forget(tid)
+        assert b.get(b.get_key_for_forgotten(tid)) is None
+        # without a boundary a late store is visible, as in legacy behavior
+        b.mark_as_done(tid, 'late-result')
+        assert b.get_state(tid) == states.SUCCESS
+
 
 class test_result_compression:
 
