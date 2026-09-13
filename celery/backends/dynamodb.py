@@ -551,6 +551,45 @@ class DynamoDBBackend(KeyValueStoreBackend):
         new_count: str = item_response["Attributes"][self._count_filed.name][self._count_filed.data_type]
         return int(new_count)
 
+    def _chord_register_member(self, group_id: str, task_id: str) -> bool:
+        """Record a returning chord member once, keyed by its real task id.
+
+        A conditional ``put_item`` (``attribute_not_exists``) is atomic in
+        DynamoDB: only the first terminal return of a member task creates the
+        marker and counts. A redelivered task with the same id fails the
+        condition and is ignored, so it can never complete the chord early
+        or settle it a second time.
+        """
+        key = str(self.get_key_for_chord(group_id, f'.{task_id}'))
+        timestamp = time()
+        item = {
+            self._key_field.name: {
+                self._key_field.data_type: key
+            },
+            self._timestamp_field.name: {
+                self._timestamp_field.data_type: str(timestamp)
+            },
+        }
+        if self._has_ttl():
+            item[self._ttl_field.name] = {
+                self._ttl_field.data_type:
+                    str(int(timestamp + self.time_to_live_seconds))
+            }
+        try:
+            self.client.put_item(
+                TableName=self.table_name,
+                Item=item,
+                ConditionExpression=(
+                    f'attribute_not_exists({self._key_field.name})'
+                ),
+            )
+        except ClientError as e:
+            if e.response['Error'].get('Code') == \
+                    'ConditionalCheckFailedException':
+                return False
+            raise
+        return True
+
     def _apply_chord_incr(self, header_result_args, body, **kwargs):
         chord_key = self.get_key_for_chord(header_result_args[0])
         init_count_request = self._prepare_init_count_request(str(chord_key))

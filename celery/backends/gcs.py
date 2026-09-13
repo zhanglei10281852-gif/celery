@@ -247,6 +247,25 @@ class GCSBackend(GCSBackendBase):
         )
         return resp.transform_results[0].integer_value
 
+    def _chord_register_member(self, group_id: str, task_id: str) -> bool:
+        """Record a returning chord member once, keyed by its real task id.
+
+        Firestore ``DocumentReference.create`` fails with ``Conflict`` when
+        the document already exists, so only the first terminal return of a
+        member task creates the marker and counts. A redelivered task with
+        the same id is ignored: it cannot complete the chord early nor
+        settle it again after cleanup, as the member document outlives the
+        counter until its TTL expires.
+        """
+        key = self.get_key_for_chord(group_id, f'.{task_id}').decode()
+        doc = self._firestore_document(key)
+        val_expires = datetime.now(timezone.utc) + timedelta(seconds=86400)
+        try:
+            doc.create({self._field_expires: val_expires})
+        except Conflict:
+            return False
+        return True
+
     def on_chord_part_return(self, request, state, result, **kwargs):
         """Chord part return callback.
 
@@ -260,6 +279,11 @@ class GCSBackend(GCSBackendBase):
         app = self.app
         gid = request.group
         if not gid:
+            return
+        # Each distinct header member contributes at most once, so a
+        # redelivered task (same task id after worker loss) only reuses the
+        # contribution already recorded and never settles the chord twice.
+        if not self._chord_register_member(gid, request.id):
             return
         key = self.get_key_for_chord(gid)
         val = self.incr(key)

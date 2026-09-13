@@ -87,24 +87,33 @@ class test_CacheBackend:
         deps.__len__.return_value = 2
         restore.return_value = deps
         task = Mock()
-        task.name = 'foobarbaz'
+        task2 = Mock()
+        task.name = task2.name = 'foobarbaz'
         self.app.tasks['foobarbaz'] = task
-        task.request.chord = signature(task)
+        task.request.chord = task2.request.chord = signature(task)
+        task.request.id = uuid()
+        task2.request.id = uuid()
 
         result_args = (
             uuid(),
             [self.app.AsyncResult(uuid()) for _ in range(3)],
         )
-        task.request.group = result_args[0]
+        task.request.group = task2.request.group = result_args[0]
         tb.apply_chord(result_args, None)
 
         deps.join_native.assert_not_called()
         tb.on_chord_part_return(task.request, 'SUCCESS', 10)
         deps.join_native.assert_not_called()
 
-        tb.on_chord_part_return(task.request, 'SUCCESS', 10)
+        # A duplicate return with the same task id must not count.
+        tb.on_chord_part_return(task.request, 'SUCCESS', 20)
+        deps.join_native.assert_not_called()
+
+        # The other, distinct member completes the chord exactly once.
+        tb.on_chord_part_return(task2.request, 'SUCCESS', 30)
         deps.join_native.assert_called_with(propagate=True, timeout=3.0)
         deps.delete.assert_called_with()
+        assert deps.join_native.call_count == 1
 
     def test_mget(self):
         self.tb._set_with_state('foo', 1, states.SUCCESS)

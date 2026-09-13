@@ -1145,6 +1145,16 @@ class BaseKeyValueStoreBackend(Backend):
     def incr(self, key):
         raise NotImplementedError('Does not implement incr')
 
+    def add(self, key, value):
+        """Set value for key only if it does not already exist.
+
+        Returns :const:`True` when the key was created by this call, and
+        :const:`False` when a value was already stored. Backends that count
+        chord parts natively implement this so that chord part returns can
+        be deduplicated by their member task id.
+        """
+        raise NotImplementedError('Does not implement add')
+
     def expire(self, key, value):
         pass
 
@@ -1329,12 +1339,54 @@ class BaseKeyValueStoreBackend(Backend):
         header_result = self.app.GroupResult(*header_result_args)
         header_result.save(backend=self)
 
+    def _chord_member_key(self, group_id, task_id):
+        """Key used to remember that a member already returned.
+
+        The marker lives as long as (or longer than) the chord counter, so
+        duplicate terminal notifications caused by a redelivered task are
+        ignored while the chord is pending and cannot re-trigger it or fail
+        its body again after the chord settled.
+        """
+        return self.get_key_for_chord(group_id, f'.{task_id}')
+
+    def _chord_register_member(self, group_id, task_id):
+        """Record that member ``task_id`` reached a terminal state.
+
+        Returns :const:`True` when this is the first terminal return of the
+        member, so the caller may add its result and count it towards
+        completion. :const:`False` means a return for the same member
+        identity was already recorded; the caller must reuse that
+        contribution and stay idle.
+
+        The default implementation relies on the atomic set-if-absent
+        :meth:`add` primitive. Backends with a different native primitive
+        (conditional writes, document creation) override this method.
+        """
+        try:
+            return bool(self.add(self._chord_member_key(group_id, task_id), 1))
+        except NotImplementedError:
+            # Backends without an add-if-absent primitive keep the legacy
+            # per-notification counting behaviour.
+            return True
+
     def on_chord_part_return(self, request, state, result, **kwargs):
         if not self.implements_incr:
             return
         app = self.app
-        gid = request.group
+        gid = getattr(request, 'group', None)
         if not gid:
+            return
+        tid = getattr(request, 'id', None)
+        if not tid:
+            return
+        # A header task can be reported more than once when its worker is
+        # lost and the broker redelivers the message with the same task id.
+        # Each distinct header member contributes at most one result and one
+        # completion, so duplicate SUCCESS/FAILURE/REVOKED notifications only
+        # reuse the contribution already recorded: they neither increment
+        # the counter nor settle the chord, and a late duplicate arriving
+        # after cleanup cannot fail the body again through a missing group.
+        if not self._chord_register_member(gid, tid):
             return
         key = self.get_key_for_chord(gid)
         try:

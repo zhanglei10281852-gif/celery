@@ -565,7 +565,16 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
         return self.client.expire(key, value)
 
     def add_to_chord(self, group_id, result):
-        self.client.incr(self.get_key_for_group(group_id, '.t'), 1)
+        tkey = self.get_key_for_group(group_id, '.t')
+        self.client.incr(tkey, 1)
+        if self.expires:
+            # The extra member settles together with the original members, so
+            # keep all live chord keys (counter, total, member identity set
+            # and pending results) under the same expiry window.
+            self.client.expire(tkey, self.expires)
+            for suffix in ('.s', '.j', '.h'):
+                self.client.expire(
+                    self.get_key_for_group(group_id, suffix), self.expires)
 
     def _unpack_chord_result(self, tup, decode,
                              EXCEPTION_STATES=states.EXCEPTION_STATES,
@@ -616,8 +625,48 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
         jkey = self.get_key_for_group(gid, '.j')
         tkey = self.get_key_for_group(gid, '.t')
         skey = self.get_key_for_group(gid, '.s')
+        # Hash mapping member task ids to their first recorded contribution.
+        # It is the source of truth for "distinct members already ready".
+        hkey = self.get_key_for_group(gid, '.h')
+        # Tombstone left behind after the chord settles so stale notifications
+        # (redelivered after worker loss or after cleanup) cannot rebuild any
+        # triggerable state before results expire.
+        dkey = self.get_key_for_group(gid, '.d')
         result = self.encode_result(result, state)
         encoded = self.encode([1, tid, state, result])
+
+        # Phase 1: bind readiness to the real header task identity. HSETNX is
+        # atomic, so concurrent redeliveries of the same task id let exactly
+        # one notification proceed; duplicates only reuse its contribution.
+        with client.pipeline() as pipe:
+            pipe.get(dkey).hsetnx(hkey, tid, encoded)
+            if self.expires:
+                pipe.expire(hkey, self.expires)
+            already_done, is_new_member, *_ = pipe.execute()
+
+        if already_done is not None:
+            # The chord already settled: roll back the hash field the guard
+            # pipeline may just have created and rebuild nothing.
+            client.hdel(hkey, tid)
+            return
+
+        if not is_new_member:
+            # Duplicate terminal notification for the same member. It must
+            # neither add a result nor consume a completion slot; merely keep
+            # the pending keys alive for the members still outstanding.
+            if self.expires:
+                with client.pipeline() as pipe:
+                    pipe \
+                        .expire(jkey, self.expires) \
+                        .expire(tkey, self.expires) \
+                        .expire(skey, self.expires) \
+                        .expire(hkey, self.expires) \
+                        .execute()
+            return
+
+        # Phase 2: the member is distinct and new - record its result and its
+        # completion exactly once. Ordered mode keeps header order via the
+        # group_index score; unordered mode keeps arrival (join) order.
         with client.pipeline() as pipe:
             pipeline = (
                 pipe.zadd(jkey, {encoded: group_index}).zcount(jkey, "-inf", "+inf")
@@ -628,66 +677,81 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
                 pipeline = pipeline \
                     .expire(jkey, self.expires) \
                     .expire(tkey, self.expires) \
-                    .expire(skey, self.expires)
+                    .expire(skey, self.expires) \
+                    .expire(hkey, self.expires)
 
             _, readycount, totaldiff, chord_size_bytes = pipeline.execute()[:4]
 
         totaldiff = int(totaldiff or 0)
 
         if chord_size_bytes:
+            total = int(chord_size_bytes) + totaldiff
+            if readycount != total:
+                return
+
+            callback = maybe_signature(request.chord, app=app)
+
+            # Claim the only body publication: the size key deletion is
+            # atomic, so concurrent notifications that also saw the chord
+            # complete lose the claim and must publish nothing nor touch the
+            # winner's pending keys. This must stay outside the try/finally
+            # below so a losing claimant never runs the settlement cleanup.
+            with client.pipeline() as pipe:
+                claimed, _ = pipe.delete(skey).delete(tkey).execute()
+            if not claimed:
+                return
+
             try:
-                callback = maybe_signature(request.chord, app=app)
-                total = int(chord_size_bytes) + totaldiff
-                if readycount == total:
-                    header_result = GroupResult.restore(gid, app=app)
-                    if header_result is not None:
-                        # If we manage to restore a `GroupResult`, then it must
-                        # have been complex and saved by `apply_chord()` earlier.
-                        #
-                        # Before we can join the `GroupResult`, it needs to be
-                        # manually marked as ready to avoid blocking
-                        header_result.on_ready()
-                        # We'll `join()` it to get the results and ensure they are
-                        # structured as intended rather than the flattened version
-                        # we'd construct without any other information.
-                        join_func = (
-                            header_result.join_native
-                            if header_result.supports_native_join
-                            else header_result.join
+                header_result = GroupResult.restore(gid, app=app)
+                if header_result is not None:
+                    # If we manage to restore a `GroupResult`, then it must
+                    # have been complex and saved by `apply_chord()` earlier.
+                    #
+                    # Before we can join the `GroupResult`, it needs to be
+                    # manually marked as ready to avoid blocking
+                    header_result.on_ready()
+                    # We'll `join()` it to get the results and ensure they are
+                    # structured as intended rather than the flattened version
+                    # we'd construct without any other information.
+                    join_func = (
+                        header_result.join_native
+                        if header_result.supports_native_join
+                        else header_result.join
+                    )
+                    with allow_join_result():
+                        resl = join_func(
+                            timeout=app.conf.result_chord_join_timeout,
+                            propagate=True
                         )
-                        with allow_join_result():
-                            resl = join_func(
-                                timeout=app.conf.result_chord_join_timeout,
-                                propagate=True
-                            )
-                    else:
-                        # Otherwise simply extract and decode the results we
-                        # stashed along the way, which should be faster for large
-                        # numbers of simple results in the chord header.
-                        decode, unpack = self.decode, self._unpack_chord_result
-                        with client.pipeline() as pipe:
-                            if self._chord_zset:
-                                pipeline = pipe.zrange(jkey, 0, -1)
-                            else:
-                                pipeline = pipe.lrange(jkey, 0, total)
-                            resl, = pipeline.execute()
-                        resl = [unpack(tup, decode) for tup in resl]
-                    try:
-                        callback.delay(resl)
-                    except Exception as exc:  # pylint: disable=broad-except
-                        logger.exception(
-                            'Chord callback for %r raised: %r', request.group, exc)
-                        return self.chord_error_from_stack(
-                            callback,
-                            ChordError(f'Callback error: {exc!r}'),
+                else:
+                    # Otherwise simply extract and decode the results we
+                    # stashed along the way, which should be faster for large
+                    # numbers of simple results in the chord header.
+                    decode, unpack = self.decode, self._unpack_chord_result
+                    with client.pipeline() as pipe:
+                        if self._chord_zset:
+                            pipeline = pipe.zrange(jkey, 0, -1)
+                        else:
+                            pipeline = pipe.lrange(jkey, 0, total)
+                        resl, = pipeline.execute()
+                    resl = [unpack(tup, decode) for tup in resl]
+                    # Every distinct member contributed exactly one result; a
+                    # shortfall means stored results/group data went missing -
+                    # fail loudly through ChordError instead of a short body.
+                    if len(resl) != total:
+                        raise ValueError(
+                            f'Chord {gid!r} is missing header results: '
+                            f'{len(resl)} of {total} ready'
                         )
-                    finally:
-                        with client.pipeline() as pipe:
-                            pipe \
-                                .delete(jkey) \
-                                .delete(tkey) \
-                                .delete(skey) \
-                                .execute()
+                try:
+                    callback.delay(resl)
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.exception(
+                        'Chord callback for %r raised: %r', request.group, exc)
+                    return self.chord_error_from_stack(
+                        callback,
+                        ChordError(f'Callback error: {exc!r}'),
+                    )
             except ChordError as exc:
                 logger.exception('Chord %r raised: %r', request.group, exc)
                 return self.chord_error_from_stack(callback, exc)
@@ -697,6 +761,19 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
                     callback,
                     ChordError(f'Join error: {exc!r}'),
                 )
+            finally:
+                # Terminal settlement (success or failure): leave the
+                # tombstone for the result lifetime and clear the live chord
+                # keys. A later old notification is a no-op.
+                if self.expires:
+                    client.set(dkey, 1, ex=self.expires)
+                with client.pipeline() as pipe:
+                    pipe \
+                        .delete(jkey) \
+                        .delete(hkey) \
+                        .delete(skey) \
+                        .delete(tkey) \
+                        .execute()
 
     def _create_client(self, **params):
         return self._get_client()(

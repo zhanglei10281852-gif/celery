@@ -69,6 +69,15 @@ class DummyClient:
     def set(self, key, value, *args, **kwargs):
         self.cache[key] = value
 
+    def add(self, key, value, *args, **kwargs):
+        # Mirror memcached's add-if-absent semantics so duplicate chord part
+        # notifications are deduplicated even for the in-memory backend.
+        with self.cache.mutex:
+            if key in self.cache.data:
+                return False
+            self.cache[key] = value
+            return True
+
     def delete(self, key, *args, **kwargs):
         self.cache.pop(key, None)
 
@@ -124,6 +133,13 @@ class CacheBackend(KeyValueStoreBackend):
 
     def set(self, key, value):
         return self.client.set(key, value, self.expires)
+
+    def add(self, key, value):
+        # Both pylibmc and python-memcached accept the expiry as the third
+        # positional argument (exptime/expire). Returns True only when the
+        # key did not exist yet, which makes chord part returns idempotent
+        # per member task id.
+        return self.client.add(key, value, self.expires)
 
     def delete(self, key):
         return self.client.delete(key)

@@ -581,6 +581,53 @@ class test_DynamoDBBackend:
             ReturnValues='UPDATED_NEW',
         )
 
+    def test_chord_register_member_new(self):
+        self.backend._client = MagicMock()
+        with patch('celery.backends.dynamodb.time', self._mock_time):
+            assert self.backend._chord_register_member('gid', 'tid') is True
+        assert self.backend._client.put_item.call_count == 1
+        _, kwargs = self.backend._client.put_item.call_args
+        assert kwargs['TableName'] == 'celery'
+        assert kwargs['ConditionExpression'] == 'attribute_not_exists(id)'
+        assert kwargs['Item']['id']['S'] == str(
+            self.backend.get_key_for_chord('gid', '.tid'))
+        assert 'ttl' not in kwargs['Item']
+
+    def test_chord_register_member_new_with_ttl(self):
+        self.backend.time_to_live_seconds = 600
+        self.backend._client = MagicMock()
+        with patch('celery.backends.dynamodb.time', self._mock_time):
+            assert self.backend._chord_register_member('gid', 'tid') is True
+        _, kwargs = self.backend._client.put_item.call_args
+        assert kwargs['Item']['ttl'] == {
+            'N': str(int(self._static_timestamp + 600)),
+        }
+
+    def test_chord_register_member_duplicate(self):
+        from botocore.exceptions import ClientError
+        self.backend._client = MagicMock()
+        self.backend._client.put_item.side_effect = ClientError(
+            {
+                'Error': {
+                    'Code': 'ConditionalCheckFailedException',
+                    'Message': 'Conditional request failed',
+                }
+            },
+            'PutItem',
+        )
+        assert self.backend._chord_register_member('gid', 'tid') is False
+
+    def test_chord_register_member_other_error_propagates(self):
+        from botocore.exceptions import ClientError
+        self.backend._client = MagicMock()
+        error = ClientError(
+            {'Error': {'Code': 'InternalServerError', 'Message': 'boom'}},
+            'PutItem',
+        )
+        self.backend._client.put_item.side_effect = error
+        with pytest.raises(ClientError):
+            self.backend._chord_register_member('gid', 'tid')
+
     def test_backend_by_url(self, url='dynamodb://'):
         from celery.app import backends
         from celery.backends.dynamodb import DynamoDBBackend

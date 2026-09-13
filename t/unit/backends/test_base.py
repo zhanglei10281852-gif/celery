@@ -1526,6 +1526,34 @@ class test_KeyValueStoreBackend:
             callback, ANY,
         )
 
+    def test_chord_part_return_duplicate_member_ignored(self):
+        # A repeated terminal return for the same member task id must reuse
+        # the recorded contribution: no counter change and no chord error,
+        # even when the group metadata has been cleaned up already.
+        self.b.implements_incr = True
+        self.b.add = Mock(return_value=False)
+        self.b.incr = Mock()
+        self.b.chord_error_from_stack = Mock()
+        request = Mock(name='request')
+        request.group = 'gid'
+        request.id = 'tid1'
+
+        assert self.b.on_chord_part_return(
+            request, states.SUCCESS, 10) is None
+        self.b.incr.assert_not_called()
+        self.b.chord_error_from_stack.assert_not_called()
+        self.b.add.assert_called_once_with(
+            self.b.get_key_for_chord('gid', '.tid1'), 1)
+
+    def test_chord_part_return_new_member_without_id_ignored(self):
+        self.b.implements_incr = True
+        self.b.add = Mock()
+        request = Mock(name='request')
+        request.group = 'gid'
+        request.id = None
+        self.b.on_chord_part_return(request, states.SUCCESS, 10)
+        self.b.add.assert_not_called()
+
     def test_filter_ready(self):
         self.b.decode_result = Mock()
         self.b.decode_result.side_effect = pass1
@@ -1550,6 +1578,8 @@ class test_KeyValueStoreBackend:
             deps.__len__.return_value = 10
             b.incr = Mock()
             b.incr.return_value = 10
+            # Member identity guard: first terminal return of a member wins.
+            b.add = Mock(return_value=True)
             b.expire = Mock()
             task = Mock()
             task.request.group = 'grid'

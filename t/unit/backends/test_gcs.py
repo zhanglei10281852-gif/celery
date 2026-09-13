@@ -336,6 +336,7 @@ class test_GCSBackend:
 
     @patch('celery.backends.gcs.maybe_signature')
     @patch.object(GCSBackend, 'incr')
+    @patch.object(GCSBackend, '_chord_register_member')
     @patch.object(GCSBackend, '_restore_deps')
     @patch.object(GCSBackend, '_delete_chord_key')
     @patch('celery.backends.gcs.allow_join_result')
@@ -346,6 +347,7 @@ class test_GCSBackend:
         mock_allow_join_result,
         mock_delete_chord_key,
         mock_restore_deps,
+        mock_register_member,
         mock_incr,
         mock_maybe_signature,
     ):
@@ -355,6 +357,7 @@ class test_GCSBackend:
         state = MagicMock()
         result = MagicMock()
         mock_firestore_ttl.return_value = True
+        mock_register_member.return_value = True
         mock_incr.return_value = 2
         mock_restore_deps.return_value = MagicMock()
         mock_restore_deps.return_value.join_native.return_value = [
@@ -367,6 +370,7 @@ class test_GCSBackend:
         b.on_chord_part_return(request, state, result)
 
         group_key = b.chord_keyprefix + b'group_id'
+        mock_register_member.assert_called_once_with('group_id', request.id)
         mock_incr.assert_called_once_with(group_key)
         mock_restore_deps.assert_called_once_with('group_id', request)
         mock_maybe_signature.assert_called_once_with(
@@ -380,6 +384,61 @@ class test_GCSBackend:
             ['result1', 'result2']
         )
         mock_delete_chord_key.assert_called_once_with(group_key)
+
+    @patch.object(GCSBackend, 'incr')
+    @patch.object(GCSBackend, '_chord_register_member')
+    @patch.object(GCSBackend, '_restore_deps')
+    @patch.object(GCSBackend, '_delete_chord_key')
+    @patch.object(GCSBackend, '_is_firestore_ttl_policy_enabled')
+    def test_on_chord_part_return_duplicate_member(
+        self,
+        mock_firestore_ttl,
+        mock_delete_chord_key,
+        mock_restore_deps,
+        mock_register_member,
+        mock_incr,
+    ):
+        # A duplicate terminal return for the same member is a no-op: no
+        # counter increment, no join, no callback and no cleanup.
+        request = MagicMock()
+        request.group = 'group_id'
+        request.chord = {'chord_size': 2}
+        mock_firestore_ttl.return_value = True
+        mock_register_member.return_value = False
+
+        b = GCSBackend(app=self.app)
+        assert b.on_chord_part_return(request, MagicMock(), MagicMock()) is None
+        mock_register_member.assert_called_once_with('group_id', request.id)
+        mock_incr.assert_not_called()
+        mock_restore_deps.assert_not_called()
+        mock_delete_chord_key.assert_not_called()
+
+    @patch.object(GCSBackend, '_firestore_document')
+    @patch.object(GCSBackend, '_is_firestore_ttl_policy_enabled')
+    def test_chord_register_member(self, mock_firestore_ttl,
+                                   mock_firestore_document):
+        mock_firestore_ttl.return_value = True
+        mock_document = MagicMock()
+        mock_firestore_document.return_value = mock_document
+        backend = GCSBackend(app=self.app)
+
+        assert backend._chord_register_member('group_id', 'task_id') is True
+        mock_document.create.assert_called_once()
+
+    @patch.object(GCSBackend, '_firestore_document')
+    @patch.object(GCSBackend, '_is_firestore_ttl_policy_enabled')
+    def test_chord_register_member_duplicate(self, mock_firestore_ttl,
+                                             mock_firestore_document):
+        from google.api_core.exceptions import Conflict
+
+        mock_firestore_ttl.return_value = True
+        mock_document = MagicMock()
+        mock_document.create.side_effect = Conflict('already exists')
+        mock_firestore_document.return_value = mock_document
+        backend = GCSBackend(app=self.app)
+
+        assert backend._chord_register_member(
+            'group_id', 'task_id') is False
 
     @patch.object(GCSBackend, '_is_firestore_ttl_policy_enabled')
     @patch('celery.backends.gcs.GroupResult.restore')
@@ -474,6 +533,7 @@ class test_GCSBackend:
 
     @patch('celery.backends.gcs.maybe_signature')
     @patch.object(GCSBackend, 'incr')
+    @patch.object(GCSBackend, '_chord_register_member')
     @patch.object(GCSBackend, '_restore_deps')
     @patch.object(GCSBackend, '_delete_chord_key')
     @patch.object(GCSBackend, 'chord_error_from_stack')
@@ -486,6 +546,7 @@ class test_GCSBackend:
         mock_chord_error_from_stack,
         mock_delete_chord_key,
         mock_restore_deps,
+        mock_register_member,
         mock_incr,
         mock_maybe_signature,
     ):
@@ -497,6 +558,7 @@ class test_GCSBackend:
         result = MagicMock()
 
         mock_firestore_ttl.return_value = True
+        mock_register_member.return_value = True
         mock_incr.return_value = 2
 
         # Mock dependencies and callback
@@ -527,6 +589,7 @@ class test_GCSBackend:
 
     @patch('celery.backends.gcs.maybe_signature')
     @patch.object(GCSBackend, 'incr')
+    @patch.object(GCSBackend, '_chord_register_member')
     @patch.object(GCSBackend, '_restore_deps')
     @patch.object(GCSBackend, '_delete_chord_key')
     @patch.object(GCSBackend, 'chord_error_from_stack')
@@ -539,6 +602,7 @@ class test_GCSBackend:
         mock_chord_error_from_stack,
         mock_delete_chord_key,
         mock_restore_deps,
+        mock_register_member,
         mock_incr,
         mock_maybe_signature,
     ):
@@ -550,6 +614,7 @@ class test_GCSBackend:
         result = MagicMock()
 
         mock_firestore_ttl.return_value = True
+        mock_register_member.return_value = True
         mock_incr.return_value = 2
 
         # Mock dependencies and callback
